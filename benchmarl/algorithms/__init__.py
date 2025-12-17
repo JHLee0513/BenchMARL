@@ -12,6 +12,7 @@ from .iql import Iql, IqlConfig
 from .isac import Isac, IsacConfig
 from .maddpg import Maddpg, MaddpgConfig
 from .mappo import Mappo, MappoConfig
+from .mbpo import Mbpo, MbpoConfig, MbpoMappo, MbpoMappoConfig, MbpoMasac
 from .masac import Masac, MasacConfig
 from .qmix import Qmix, QmixConfig
 from .vdn import Vdn, VdnConfig
@@ -29,6 +30,11 @@ classes = [
     "MaddpgConfig",
     "Mappo",
     "MappoConfig",
+    "Mbpo",
+    "MbpoConfig",
+    "MbpoMasac",
+    "MbpoMappo",
+    "MbpoMappoConfig",
     "Masac",
     "MasacConfig",
     "Qmix",
@@ -45,6 +51,8 @@ algorithm_config_registry = {
     "maddpg": MaddpgConfig,
     "iddpg": IddpgConfig,
     "masac": MasacConfig,
+    "mbpo": MbpoConfig,
+    "mbpo_mappo": MbpoMappoConfig,
     "isac": IsacConfig,
     "qmix": QmixConfig,
     "vdn": VdnConfig,

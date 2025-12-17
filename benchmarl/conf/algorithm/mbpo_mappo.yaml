@@ -1,0 +1,36 @@
+defaults:
+  - mbpo_mappo_config
+  - _self_
+
+# MAPPO backbone defaults
+share_param_critic: True
+clip_epsilon: 0.2
+entropy_coef: 0.0
+critic_coef: 1.0
+loss_critic_type: "l2"
+lmbda: 0.9
+scale_mapping: "biased_softplus_1.0"
+use_tanh_normal: True
+minibatch_advantage: False
+
+# MBPO-specific knobs
+rollout_horizon: 10
+model_train_freq: 1
+ensemble_size: 5
+# Number of elite models to sample from during rollouts (defaults to all if null)
+n_elites: null
+model_batch_size: 256
+real_ratio: 0.5
+temperature: 1.0
+model_lr: 0.001
+model_hidden_size: 256
+model_num_layers: 2
+stochastic_dynamics: True
+min_log_var: -10.0
+max_log_var: -2.0
+
+# If True, learn a single centralized world model per agent-group that predicts the
+# joint next observation given the joint observation and all agents' actions.
+centralized_dynamics: False
+
+
