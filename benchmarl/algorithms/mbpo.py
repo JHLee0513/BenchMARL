@@ -120,39 +120,25 @@ class _MixedReplayBuffer:
         n_real = max(1, min(total, int(math.ceil(total * rr))))
         n_synth = max(0, total - n_real)
 
-        real_td = self._safe_sample(self._real, n_real)
+        # If no synthetic is needed, behave exactly like the real buffer.
         if n_synth <= 0:
-            return real_td
+            return self._safe_sample(self._real, total)
 
-        # If synthetic buffer is empty or not enough, fall back to real for the missing samples.
+        # If synthetic buffer is empty, fall back to real-only in a *single* call
+        # (avoids changing SamplerWithoutReplacement behavior).
         try:
             synth_len = len(self._synthetic)
         except Exception:
             synth_len = 0
+        if synth_len <= 0:
+            return self._safe_sample(self._real, total)
 
         n_synth = min(n_synth, synth_len)
-        missing_synth = total - n_real - n_synth
-
-        # Always sample from synthetic buffer what we can
-        synth_td = self._safe_sample(self._synthetic, n_synth) if n_synth > 0 else None
-
-        # If not enough synthetic, sample additional real for the missing requested amount
-        if missing_synth > 0:
-            # Sample additional from real
-            extra_real_td = self._safe_sample(self._real, missing_synth)
-            if synth_td is not None:
-                # Return: [real_td, synth_td, extra_real_td]
-                return torch.cat([real_td, synth_td, extra_real_td], dim=0)
-            else:
-                # Only real samples available
-                return torch.cat([real_td, extra_real_td], dim=0)
-        else:
-            # We have enough synthetic (n_synth), or none was needed
-            if synth_td is not None:
-                return torch.cat([real_td, synth_td], dim=0)
-            else:
-                return real_td
-
+        # One call to real buffer, one call to synthetic buffer.
+        real_td = self._safe_sample(self._real, total - n_synth)
+        synth_td = self._safe_sample(self._synthetic, n_synth)
+        if synth_td is None:
+            return real_td
         return torch.cat([real_td, synth_td], dim=0)
 
 
@@ -417,6 +403,11 @@ class _MbpoWorldModelMixin:
         
         # Track last save step for interval-based saving
         self._last_save_step: Dict[str, int] = {group: 0 for group in self.group_map.keys()}
+        # Use a dedicated RNG for world-model training so we don't perturb the policy/replay sampling RNG.
+        # This is critical for on-policy algorithms: consuming global RNG here can change minibatch order.
+        seed = int(getattr(self.experiment, "seed", 0))
+        self._world_model_rng = torch.Generator(device="cpu")
+        self._world_model_rng.manual_seed(seed + 10_000_019)
 
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
         # Ensure the synthetic buffer exists (created via get_replay_buffer()).
@@ -431,7 +422,7 @@ class _MbpoWorldModelMixin:
 
         self._train_steps[group] += 1
         if self._train_steps[group] % self.model_train_freq == 0:
-            # self._train_dynamics(group, flat_batch)
+            self._train_dynamics(group, flat_batch)
             if self._train_steps[group] > self.warmup_steps:
                 pass
                 # synthetic = self._generate_model_rollouts(group, flat_batch)
@@ -540,7 +531,15 @@ class _MbpoWorldModelMixin:
             optimizer.zero_grad()
 
             # Bootstrap indices (with replacement)
-            idx = torch.randint(0, n_samples, (n_samples,), device=obs_flat.device)
+            # IMPORTANT: use a dedicated RNG so world-model training does not perturb
+            # the global RNG used by on-policy sampling / policy stochasticity.
+            idx = torch.randint(
+                0,
+                n_samples,
+                (n_samples,),
+                device="cpu",
+                generator=getattr(self, "_world_model_rng", None),
+            ).to(obs_flat.device)
             o = obs_flat[idx]
             a = action_flat[idx]
             no = next_obs_flat[idx]
