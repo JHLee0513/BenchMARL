@@ -1,23 +1,19 @@
 defaults:
-  - mbpo_config
+  - gmpo_mappo_config
   - _self_
 
-# MASAC backbone defaults
+# MAPPO backbone defaults
 share_param_critic: True
-num_qvalue_nets: 2
-loss_function: "l2"
-delay_qvalue: True
-target_entropy: "auto"
-discrete_target_entropy_weight: 0.2
-alpha_init: 1.0
-min_alpha: null
-max_alpha: null
-fixed_alpha: False
+clip_epsilon: 0.2
+entropy_coef: 0.0
+critic_coef: 1.0
+loss_critic_type: "l2"
+lmbda: 0.9
 scale_mapping: "biased_softplus_1.0"
 use_tanh_normal: True
-coupled_discrete_values: True
+minibatch_advantage: False
 
-# MBPO-specific knobs
+# GNN-MBPO-specific knobs
 warmup_steps: 2500 # Number of steps to train the model for before using it to sample synthetic rollout
 rollout_horizon: 10
 model_train_freq: 1
@@ -37,6 +33,14 @@ max_log_var: -2.0
 # If True, learn a single centralized world model per agent-group that predicts the
 # joint next observation given the joint observation and all agents' actions.
 centralized_dynamics: False
+
+# GNN-specific parameters
+gnn_class: torch_geometric.nn.conv.GraphConv
+gnn_kwargs:
+  aggr: "add"
+edge_radius: 1.0  # Radius for proximity-based graph construction
+pos_dim: 2  # Dimension of position features (assumed to be first pos_dim dims of obs)
+self_loops: False  # Whether to include self-loops in the graph
 
 # Path to a pretrained world model to load (set to null to train from scratch)
 load_world_model_path: null

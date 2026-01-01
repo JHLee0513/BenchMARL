@@ -1,171 +1,26 @@
 import math
 from dataclasses import MISSING, dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Type, Any, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModule
-from torchrl.data import (
-    Composite,
-    LazyMemmapStorage,
-    LazyTensorStorage,
-    ReplayBuffer,
-    TensorDictReplayBuffer,
-    Unbounded,
-)
-from torchrl.data.replay_buffers import SamplerWithoutReplacement
-from torchrl.data.replay_buffers.samplers import RandomSampler
-from torchrl.envs import Compose, Transform
+from torchrl.data import Composite, Unbounded
 from torchrl.objectives import LossModule
 
 from benchmarl.algorithms.mappo import Mappo, MappoConfig
 from benchmarl.algorithms.masac import Masac, MasacConfig
 from benchmarl.models.common import ModelConfig
 
+from benchmarl.algorithms.mbpo import _DynamicsModel
+from benchmarl.utils import _class_from_name
 
-class _MixedReplayBuffer:
-    """A thin wrapper that mixes samples from a real and a synthetic replay buffer.
+import torch_geometric
 
-    This lets us keep BenchMARL's core Experiment logic unchanged:
-    - Experiment always calls `replay_buffer.extend(real_batch)` once per iteration.
-    - Experiment always calls `replay_buffer.sample()` to obtain training minibatches.
-
-    For MBPO we want synthetic rollouts to *not* pollute the on-policy (real) buffer,
-    but we still want them to participate in training. This wrapper routes:
-    - `extend()` -> real buffer
-    - `sample()` -> returns a concatenation of samples from real + synthetic buffers
-    """
-
-    def __init__(
-        self,
-        *,
-        real: ReplayBuffer,
-        synthetic: ReplayBuffer,
-        get_real_ratio: Callable[[], float],
-        on_policy: bool,
-    ):
-        self._real = real
-        self._synthetic = synthetic
-        self._get_real_ratio = get_real_ratio
-        self._on_policy = on_policy
-
-    @property
-    def storage(self):
-        # Experiment uses `group_buffer.storage.device` before extend.
-        return self._real.storage
-
-    @property
-    def batch_size(self):
-        return getattr(self._real, "batch_size", None)
-
-    def __len__(self):
-        return len(self._real)
-
-    def state_dict(self):
-        return {
-            "real": self._real.state_dict(),
-            "synthetic": self._synthetic.state_dict(),
-        }
-
-    def load_state_dict(self, state_dict):
-        # Backward compatible: if older checkpoints only contain a single buffer state,
-        # load it into the real buffer.
-        if isinstance(state_dict, dict) and "real" in state_dict and "synthetic" in state_dict:
-            self._real.load_state_dict(state_dict["real"])
-            self._synthetic.load_state_dict(state_dict["synthetic"])
-        else:
-            self._real.load_state_dict(state_dict)
-
-    def empty(self):
-        if hasattr(self._real, "empty"):
-            self._real.empty()
-        if hasattr(self._synthetic, "empty"):
-            self._synthetic.empty()
-
-    def extend(self, data: TensorDictBase):
-        return self._real.extend(data)
-
-    def update_tensordict_priority(self, data: TensorDictBase):
-        # Priorities apply to the real buffer only.
-        if hasattr(self._real, "update_tensordict_priority"):
-            return self._real.update_tensordict_priority(data)
-
-    def _safe_sample(self, buffer: ReplayBuffer, n: int) -> Optional[TensorDictBase]:
-        if n <= 0:
-            return None
-        try:
-            return buffer.sample(batch_size=n)
-        except TypeError:
-            # Some torchrl versions don't accept batch_size kwarg.
-            try:
-                return buffer.sample(n)
-            except Exception:
-                td = buffer.sample()
-                return td[:n]
-
-    def sample(self, *args, **kwargs) -> TensorDictBase:
-        # Experiment calls `sample()` without args, so we treat any passed args as optional.
-        if args:
-            total = int(args[0])
-        else:
-            total = int(kwargs.get("batch_size", self.batch_size))
-
-        # Guard against unexpected None.
-        total = max(1, int(total))
-
-        rr = float(self._get_real_ratio() or 1.0)
-        rr = min(max(rr, 0.0), 1.0)
-        n_real = max(1, min(total, int(math.ceil(total * rr))))
-        n_synth = max(0, total - n_real)
-
-        real_td = self._safe_sample(self._real, n_real)
-        if n_synth <= 0:
-            return real_td
-
-        # If synthetic buffer is empty or not enough, fall back to real for the missing samples.
-        try:
-            synth_len = len(self._synthetic)
-        except Exception:
-            synth_len = 0
-
-        n_synth = min(n_synth, synth_len)
-        missing_synth = total - n_real - n_synth
-
-        # Always sample from synthetic buffer what we can
-        synth_td = self._safe_sample(self._synthetic, n_synth) if n_synth > 0 else None
-
-        # If not enough synthetic, sample additional real for the missing requested amount
-        if missing_synth > 0:
-            # Sample additional from real
-            extra_real_td = self._safe_sample(self._real, missing_synth)
-            if synth_td is not None:
-                # Return: [real_td, synth_td, extra_real_td]
-                return torch.cat([real_td, synth_td, extra_real_td], dim=0)
-            else:
-                # Only real samples available
-                return torch.cat([real_td, extra_real_td], dim=0)
-        else:
-            # We have enough synthetic (n_synth), or none was needed
-            if synth_td is not None:
-                return torch.cat([real_td, synth_td], dim=0)
-            else:
-                return real_td
-
-        return torch.cat([real_td, synth_td], dim=0)
-
-
-class _DynamicsModel(nn.Module):
-    """
-    Simple dynamics model that predicts next observations, rewards and done logits
-    for a whole agent group.
-
-    It supports two modes:
-    - per-agent: predicts per-agent next observation, reward and done.
-    - centralized: predicts joint next observation and per-agent reward/done from
-      joint observation and joint action.
-    """
+class _GNNDynamicsModel(_DynamicsModel):
+    """GNN-based dynamics model that predicts next observations, rewards and done logits for a whole agent group."""
 
     def __init__(
         self,
@@ -178,140 +33,346 @@ class _DynamicsModel(nn.Module):
         stochastic: bool,
         min_log_var: float,
         max_log_var: float,
+        topology: str = "full",
+        gnn_class: Type[torch_geometric.nn.MessagePassing] = torch_geometric.nn.conv.GraphConv,
+        gnn_kwargs: dict = {},
+        n_agents: int = 0,
+        self_loops: bool = False,
+        edge_radius: float = 1.0,
+        pos_dim: int = 2,
+        obs_dim_per_agent: Optional[int] = None,
+        device: str = "cpu",
     ):
-        super().__init__()
-        layers: List[nn.Module] = []
-        last_dim = input_dim
-        for _ in range(num_layers):
-            layers += [nn.Linear(last_dim, hidden_size), nn.ReLU()]
-            last_dim = hidden_size
-        self.net = nn.Sequential(*layers)
+        super().__init__(
+            input_dim=input_dim,
+            next_obs_dim=next_obs_dim,
+            reward_dim=reward_dim,
+            done_dim=done_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            stochastic=stochastic,
+            min_log_var=min_log_var,
+            max_log_var=max_log_var,
+        )
 
-        assert not stochastic, "Stochastic dynamics are currently disabled on purpose"
+        try:
+            import torch_geometric
+            from torch_geometric.utils import dense_to_sparse, remove_self_loops
+        except ImportError:
+            raise ImportError(
+                "torch_geometric is required for GNN-based MBPO. "
+                "Install it with: pip install torch-geometric"
+            )
+
+        # GNN-Dynamics model needs to replace self.net with GNN layers
+        # GNN always works with per-agent/node features
+        # Compute per-agent input dimension:
+        # - In centralized mode: input_dim = n_agents * (obs_dim + action_dim), so per-agent = input_dim // n_agents
+        # - In per-agent mode: input_dim = obs_dim + action_dim, so per-agent = input_dim
+        # We can infer the mode: if next_obs_dim is divisible by n_agents, it's likely centralized
+        if n_agents is not None and n_agents > 0:
+            # Check if centralized mode (next_obs_dim = n_agents * obs_dim_per_agent)
+            if next_obs_dim % n_agents == 0:
+                # Centralized mode: input_dim is total, divide by n_agents
+                current_dim = input_dim // n_agents
+            else:
+                # Per-agent mode: input_dim is already per-agent
+                current_dim = input_dim
+        else:
+            current_dim = input_dim
+
+        self.gnn_layers = nn.ModuleList()
+        for i in range(num_layers):
+            layer_kwargs = gnn_kwargs.copy()
+            layer_kwargs.update({
+                "in_channels": current_dim,
+                "out_channels": hidden_size,
+            })
+            gnn_layer = gnn_class(**layer_kwargs)
+            self.gnn_layers.append(gnn_layer)
+            current_dim = hidden_size
+
+        # Create edge index based on topology
+        if topology == "full" and n_agents is not None:
+            adjacency = torch.ones(n_agents, n_agents, device=device, dtype=torch.long)
+            edge_index, _ = dense_to_sparse(adjacency)
+            if not self_loops:
+                edge_index, _ = remove_self_loops(edge_index)
+            self.register_buffer("edge_index", edge_index)
+        elif topology == "empty":
+            if self_loops and n_agents is not None:
+                edge_index = (
+                    torch.arange(n_agents, device=device, dtype=torch.long)
+                    .unsqueeze(0)
+                    .repeat(2, 1)
+                )
+            else:
+                edge_index = torch.empty((2, 0), device=device, dtype=torch.long)
+            self.register_buffer("edge_index", edge_index)
+        else:
+            # For "from_pos" topology, edge_index will be computed dynamically
+            self.edge_index = None
+
+        self.n_agents = n_agents
+        self.topology = topology
+        self.edge_radius = edge_radius
+        self.pos_dim = pos_dim
+        self.self_loops = self_loops
 
         self._stochastic = stochastic
         # Bounds used to keep log-variances well-behaved (softplus clamp like PETS/MAMBPO)
         self.register_buffer("_min_log_var", torch.tensor(float(min_log_var)))
         self.register_buffer("_max_log_var", torch.tensor(float(max_log_var)))
 
-        # Predict mean(delta_next_obs), mean(reward), and optionally log-variances; plus done logits.
-        self.mu_head = nn.Linear(last_dim, next_obs_dim + reward_dim)
-        self.log_var_head = nn.Linear(last_dim, next_obs_dim + reward_dim)
-        self.done_head = nn.Linear(last_dim, done_dim)
+        # Compute per-agent observation dimension
+        # For centralized: next_obs_dim = n_agents * obs_dim_per_agent
+        # For per-agent: next_obs_dim = obs_dim_per_agent
+        if obs_dim_per_agent is not None:
+            self._obs_dim_per_agent = obs_dim_per_agent
+        elif n_agents is not None and n_agents > 0:
+            # Infer from next_obs_dim: if it's divisible by n_agents, it's centralized
+            if next_obs_dim % n_agents == 0:
+                self._obs_dim_per_agent = next_obs_dim // n_agents
+            else:
+                # Per-agent mode: next_obs_dim is already per-agent
+                self._obs_dim_per_agent = next_obs_dim
+        else:
+            # Fallback: assume per-agent mode
+            self._obs_dim_per_agent = next_obs_dim
 
-        self._next_obs_dim = next_obs_dim
-        self._reward_dim = reward_dim
-        self._done_dim = done_dim
+        # Each agent predicts only its own: obs_dim + reward (1)
+        # So per-agent output is: obs_dim_per_agent + 1
+        per_agent_output_dim = self._obs_dim_per_agent + 1
+        
+        # Predict mean(delta_next_obs), mean(reward), and optionally log-variances; plus done logits.
+        # Each agent node predicts only its own state, reward, and done
+        self.mu_head = nn.Linear(current_dim, per_agent_output_dim)
+        self.log_var_head = nn.Linear(current_dim, per_agent_output_dim)
+        self.done_head = nn.Linear(current_dim, 1)  # Each agent predicts its own done
+
+        # Store the expected output dimensions (for reshaping later)
+        self._next_obs_dim = next_obs_dim  # Total output obs dim (may be centralized)
+        self._reward_dim = reward_dim  # Total output reward dim (may be centralized)
+        self._done_dim = done_dim  # Total output done dim (may be centralized)
+
+    def _compute_dynamic_edges(
+        self, obs: torch.Tensor, batch_size: int, n_agents: int
+    ) -> torch.Tensor:
+        """
+        Compute edge_index dynamically based on agent positions.
+        
+        Args:
+            obs: [B*n_agents, obs_dim] or [B, n_agents, obs_dim] observations
+            batch_size: Batch size
+            n_agents: Number of agents
+            
+        Returns:
+            edge_index: [2, num_edges] tensor of edge indices
+        """
+        from torch_geometric.utils import dense_to_sparse
+        
+        # Check that observation has enough dimensions for position extraction
+        obs_dim = obs.shape[-1]
+        if obs_dim < self.pos_dim:
+            raise ValueError(
+                f"Observation dimension ({obs_dim}) is less than pos_dim ({self.pos_dim}). "
+                f"Cannot extract position information for dynamic graph construction."
+            )
+        
+        # Extract position information (first pos_dim dimensions of observation)
+        if obs.dim() == 3:
+            # [B, n_agents, obs_dim]
+            pos = obs[..., :self.pos_dim]  # [B, n_agents, pos_dim]
+        else:
+            # [B*n_agents, obs_dim]
+            pos = obs[:, :self.pos_dim]  # [B*n_agents, pos_dim]
+            pos = pos.view(batch_size, n_agents, self.pos_dim)  # [B, n_agents, pos_dim]
+        
+        # Compute pairwise distances: [B, n_agents, n_agents]
+        # pos: [B, n_agents, pos_dim]
+        pos_i = pos.unsqueeze(2)  # [B, n_agents, 1, pos_dim]
+        pos_j = pos.unsqueeze(1)  # [B, 1, n_agents, pos_dim]
+        distances = torch.norm(pos_i - pos_j, dim=-1)  # [B, n_agents, n_agents]
+        
+        # Create adjacency matrix based on edge_radius
+        adjacency = distances <= self.edge_radius  # [B, n_agents, n_agents]
+        
+        # Remove self-loops if not desired
+        if not self.self_loops:
+            mask = ~torch.eye(n_agents, dtype=torch.bool, device=obs.device).unsqueeze(0)
+            adjacency = adjacency & mask
+        
+        # Convert to edge_index format for each batch
+        edge_indices = []
+        for b in range(batch_size):
+            # Get edges for this batch
+            adj_b = adjacency[b]  # [n_agents, n_agents]
+            edge_index_b, _ = dense_to_sparse(adj_b.long())
+            # Add batch offset
+            edge_index_b = edge_index_b + b * n_agents
+            edge_indices.append(edge_index_b)
+        
+        # Concatenate all edges
+        if edge_indices:
+            edge_index = torch.cat(edge_indices, dim=1)  # [2, total_edges]
+        else:
+            edge_index = torch.empty((2, 0), device=obs.device, dtype=torch.long)
+        
+        return edge_index
 
     def forward(
         self, obs_flat: torch.Tensor, action_flat: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = torch.cat([obs_flat, action_flat], dim=-1)
-        feat = self.net(x)
-        mu = self.mu_head(feat)
-        log_var = self.log_var_head(feat)
-        done_logit = self.done_head(feat)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through GNN dynamics model.
+        
+        Args:
+            obs_flat: [B, n_agents*obs_dim] or [B, n_agents, obs_dim] observations
+            action_flat: [B, n_agents*action_dim] or [B, n_agents, action_dim] actions
+            
+        Returns:
+            mu_next_obs, lv_delta, mu_rew, lv_rew, done_logit
+        """
+
+
+        # Handle input shapes.
+        # Expected inputs are:
+        # - [B, n_agents, dim] (per-agent structure), or
+        # - [B, n_agents * dim] (centralized flattened joint vectors).
+        input_was_3d = obs_flat.dim() == 3
+        if input_was_3d:
+            batch_size = obs_flat.shape[0]
+            n_agents = obs_flat.shape[1]
+            obs_original = obs_flat  # Keep original for position extraction
+            obs_flat = obs_flat.view(-1, obs_flat.shape[-1])  # [B*n_agents, obs_dim]
+            action_flat = action_flat.view(-1, action_flat.shape[-1])  # [B*n_agents, action_dim]
+        else:
+            if self.n_agents is None:
+                raise ValueError(
+                    f"n_agents must be specified when input is 2D, but got {self.n_agents}"
+                )
+            batch_size = obs_flat.shape[0]  # B
+            n_agents = self.n_agents
+            obs_original = obs_flat.view(batch_size, n_agents, -1)  # [B, n_agents, obs_dim]
+            action_original = action_flat.view(batch_size, n_agents, -1)  # [B, n_agents, action_dim]
+            obs_flat = obs_original.view(-1, obs_original.shape[-1])  # [B*n_agents, obs_dim]
+            action_flat = action_original.view(-1, action_original.shape[-1])  # [B*n_agents, action_dim]
+
+        # Concatenate obs and action for node features
+        x = torch.cat([obs_flat, action_flat], dim=-1)  # [B*n_agents, obs_dim + action_dim]
+
+        # Get or create edge index
+        if self.edge_index is not None:
+            edge_index = self.edge_index
+            # Expand edge_index for batch
+            if batch_size > 1:
+                n_edges = edge_index.shape[1]
+                # Create batch offsets: [0, n_agents, 2*n_agents, ...]
+                batch_offsets = torch.arange(batch_size, device=x.device) * n_agents
+                # Expand edge_index: [2, n_edges] -> [2, n_edges * batch_size]
+                edge_index_expanded = edge_index.repeat(1, batch_size)
+                # Add offsets to each batch's edges
+                offsets = batch_offsets.repeat_interleave(n_edges).unsqueeze(0).repeat(2, 1)
+                edge_index = edge_index_expanded + offsets
+        else:
+            # For "from_pos" topology, compute edges dynamically based on positions
+            if self.topology == "from_pos":
+                edge_index = self._compute_dynamic_edges(obs_original, batch_size, n_agents)
+            else:
+                raise ValueError(f"Unknown topology: {self.topology}")
+
+        # Process through GNN layers
+        for gnn_layer in self.gnn_layers:
+            x = gnn_layer(x, edge_index)
+
+        # Reshape back to [B, n_agents, hidden_size] - preserve per-agent features
+        # x is [B*n_agents, hidden_size] after GNN
+        x = x.view(n_agents, batch_size, -1).permute(1,0,2) #x.view(batch_size, n_agents, -1)  # [B, n_agents, hidden_size]
+
+        # Apply output heads per-agent
+        # Each agent predicts only its own: obs_dim_per_agent + reward (1) + done (1)
+        x_flat = x.reshape(-1, x.shape[-1])  # [B*n_agents, hidden_size]
+        mu_all = self.mu_head(x_flat)  # [B*n_agents, obs_dim_per_agent + 1 + 1]
+        log_var_all = self.log_var_head(x_flat)  # [B*n_agents, obs_dim_per_agent + 1 + 1]
+        done_logit = self.done_head(x_flat)  # [B*n_agents, 1]
+        
+        # Split per-agent predictions: each agent predicts [obs_dim, reward, done]
+        mu_delta_per_agent = mu_all[..., :self._obs_dim_per_agent]  # [B*n_agents, obs_dim_per_agent]
+        mu_rew_per_agent = mu_all[..., self._obs_dim_per_agent:self._obs_dim_per_agent + 1]  # [B*n_agents, 1]
+        lv_delta_per_agent = log_var_all[..., :self._obs_dim_per_agent]  # [B*n_agents, obs_dim_per_agent]
+        lv_rew_per_agent = log_var_all[..., self._obs_dim_per_agent:self._obs_dim_per_agent + 1]  # [B*n_agents, 1]
 
         # Softplus-based clamp to [min_log_var, max_log_var]
         max_lv = self._max_log_var
         min_lv = self._min_log_var
-        log_var = max_lv - F.softplus(max_lv - log_var)
-        log_var = min_lv + F.softplus(log_var - min_lv)
+        lv_delta_per_agent = max_lv - F.softplus(max_lv - lv_delta_per_agent)
+        lv_delta_per_agent = min_lv + F.softplus(lv_delta_per_agent - min_lv)
+        lv_rew_per_agent = max_lv - F.softplus(max_lv - lv_rew_per_agent)
+        lv_rew_per_agent = min_lv + F.softplus(lv_rew_per_agent - min_lv)
 
         if not self._stochastic:
-            log_var = log_var * 0.0
+            lv_delta_per_agent = lv_delta_per_agent * 0.0
+            lv_rew_per_agent = lv_rew_per_agent * 0.0
 
-        next_obs_end = self._next_obs_dim
-        reward_end = next_obs_end + self._reward_dim
+        # Reshape to [B, n_agents, ...] for aggregation
+        mu_delta = mu_delta_per_agent.view(batch_size, n_agents, self._obs_dim_per_agent)  # [B, n_agents, obs_dim_per_agent]
+        mu_rew = mu_rew_per_agent.view(batch_size, n_agents, 1)  # [B, n_agents, 1]
+        lv_delta = lv_delta_per_agent.view(batch_size, n_agents, self._obs_dim_per_agent)  # [B, n_agents, obs_dim_per_agent]
+        lv_rew = lv_rew_per_agent.view(batch_size, n_agents, 1)  # [B, n_agents, 1]
+        done_logit = done_logit.view(batch_size, n_agents, 1)  # [B, n_agents, 1]
 
-        mu_delta = mu[..., :next_obs_end]
-        mu_rew = mu[..., next_obs_end:reward_end]
-        lv_delta = log_var[..., :next_obs_end]
-        lv_rew = log_var[..., next_obs_end:reward_end]
+        # Predict next obs as delta
+        # Reshape obs_flat to [B, n_agents, obs_dim_per_agent] for per-agent addition
+        # Verify that obs_flat has the correct per-agent dimension
+        obs_flat = obs_flat.reshape(batch_size, n_agents, -1)
+        obs_dim_from_input = obs_flat.shape[-1]
+        if obs_dim_from_input != self._obs_dim_per_agent:
+            raise ValueError(
+                f"Observation dimension mismatch: obs_flat.shape[-1]={obs_dim_from_input}, "
+                f"but model expects obs_dim_per_agent={self._obs_dim_per_agent}. "
+                f"This suggests a mismatch between model initialization and input data."
+            )
+        obs_reshaped = obs_flat.view(batch_size, n_agents, self._obs_dim_per_agent)  # [B, n_agents, obs_dim_per_agent]
+        mu_next_obs_per_agent = obs_reshaped + mu_delta  # [B, n_agents, obs_dim_per_agent]
 
-        mu_next_obs = obs_flat + mu_delta
+        # Aggregate per-agent predictions to match expected output format
+        # For centralized: flatten to [B, n_agents * obs_dim_per_agent] = [B, next_obs_dim]
+        # For per-agent: flatten to [B*n_agents, obs_dim_per_agent] = [B*n_agents, next_obs_dim]
+        if self._next_obs_dim == n_agents * self._obs_dim_per_agent:
+            # Centralized mode: concatenate all agents' predictions
+            mu_next_obs = mu_next_obs_per_agent.reshape(batch_size, -1)  # [B, n_agents * obs_dim_per_agent]
+            lv_delta = lv_delta.reshape(batch_size, -1)  # [B, n_agents * obs_dim_per_agent]
+            mu_rew = mu_rew.reshape(batch_size, n_agents)  # [B, n_agents] (squeeze last dim)
+            lv_rew = lv_rew.reshape(batch_size, n_agents)  # [B, n_agents]
+            done_logit = done_logit.reshape(batch_size, n_agents)  # [B, n_agents]
+        else:
+            # Per-agent mode: keep as [B*n_agents, obs_dim_per_agent]
+            mu_next_obs = mu_next_obs_per_agent.reshape(-1, self._obs_dim_per_agent)  # [B*n_agents, obs_dim_per_agent]
+            lv_delta = lv_delta.reshape(-1, self._obs_dim_per_agent)  # [B*n_agents, obs_dim_per_agent]
+            mu_rew = mu_rew.reshape(-1, 1)  # [B*n_agents, 1]
+            lv_rew = lv_rew.reshape(-1, 1)  # [B*n_agents, 1]
+            done_logit = done_logit.reshape(-1, 1)  # [B*n_agents, 1]
+
         return mu_next_obs, lv_delta, mu_rew, lv_rew, done_logit
 
 
-class _MbpoWorldModelMixin:
-    """MBPO world-model implementation shared across different base algorithms."""
-
-    def get_replay_buffer(
-        self, group: str, transforms: List = None
-    ) -> ReplayBuffer:
-        # Create the real buffer using the default BenchMARL logic.
-        real_buffer = super().get_replay_buffer(group=group, transforms=transforms)
-
-        # Create a dedicated synthetic buffer with enough capacity for model rollouts.
-        # We size it relative to the on-policy real buffer size for this run.
-        base_memory_size = self.experiment_config.replay_buffer_memory_size(self.on_policy)
-        rr = float(getattr(self, "real_ratio", 1.0))
-        rr = min(max(rr, 0.0), 1.0)
-        horizon = max(0, int(getattr(self, "rollout_horizon", 0)))
-        synthetic_multiplier = (1.0 - rr) * float(horizon)
-        synthetic_memory_size = int(math.ceil(base_memory_size * max(0.0, synthetic_multiplier)))
-        synthetic_memory_size = max(1, synthetic_memory_size)
-
-        synthetic_buffer = self._get_synthetic_rollout_replay_buffer(
-            group=group, memory_size=synthetic_memory_size, transforms=transforms
-        )
-
-        # Keep a handle to the synthetic buffer so `process_batch()` can fill it.
-        if not hasattr(self, "_synthetic_replay_buffers"):
-            self._synthetic_replay_buffers = {}
-        self._synthetic_replay_buffers[group] = synthetic_buffer
-
-        return _MixedReplayBuffer(
-            real=real_buffer,
-            synthetic=synthetic_buffer,
-            get_real_ratio=lambda: getattr(self, "real_ratio", 1.0),
-            on_policy=getattr(self, "on_policy", False),
-        )
+class _GmpoWorldModelMixin:
+    """GNN-MBPO world-model implementation shared across different base algorithms.
+    
+    This is similar to _MbpoWorldModelMixin but always uses GNN-based dynamics models.
+    """
 
     def replay_buffer_memory_size_multiplier(self) -> float:
-        # Do NOT inflate the main replay buffer: synthetic rollouts are stored separately.
-        return 1.0
+        # If we are not mixing synthetic data (e.g., RNN case), don't inflate.
+        if getattr(self, "has_rnn", False):
+            return 1.0
+        rr = float(getattr(self, "real_ratio", 1.0))
+        rr = min(max(rr, 0.0), 1.0)
+        horizon = int(getattr(self, "rollout_horizon", 0))
+        horizon = max(horizon, 0)
+        return 1.0 + (1.0 - rr) * float(horizon)
 
-    def _get_synthetic_rollout_replay_buffer(
-        self, group: str, memory_size: int, transforms: Optional[List[Transform]] = None
-    ) -> ReplayBuffer:
-        """Create a dedicated replay buffer for synthetic world-model rollouts."""
-        memory_size = max(1, int(memory_size))
-
-        sampling_size = self.experiment_config.train_minibatch_size(self.on_policy)
-        if self.has_rnn:
-            # RNN synthetic mixing isn't supported yet (matches existing code behaviour).
-            sampling_size = 1
-
-        sampler = SamplerWithoutReplacement() if self.on_policy else RandomSampler()
-
-        if self.buffer_device == "disk" and not self.on_policy:
-            storage = LazyMemmapStorage(
-                memory_size,
-                device=self.device,
-                scratch_dir=self.experiment.folder_name / f"synthetic_buffer_{group}",
-            )
-        else:
-            storage = LazyTensorStorage(
-                memory_size,
-                device=self.device if self.on_policy else self.buffer_device,
-            )
-
-        return TensorDictReplayBuffer(
-            storage=storage,
-            sampler=sampler,
-            batch_size=sampling_size,
-            priority_key=(group, "td_error"),
-            transform=Compose(*transforms) if transforms is not None else None,
-        )
-
-    def _ensure_synthetic_replay_buffers(self) -> None:
-        # Kept for backward compatibility with older in-progress branches, but buffer
-        # creation is now handled by `get_replay_buffer()` to avoid touching Experiment.
-        if not hasattr(self, "_synthetic_replay_buffers"):
-            self._synthetic_replay_buffers: Dict[str, ReplayBuffer] = {}
-
-    def _mbpo_init(
+    def _gmpo_init(
         self,
         *,
         rollout_horizon: int,
@@ -333,6 +394,13 @@ class _MbpoWorldModelMixin:
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
         save_world_model_interval: Optional[int] = None,
+        # GNN-specific parameters
+        topology: str = "full",
+        gnn_class: Union[Type[torch_geometric.nn.MessagePassing], str] = torch_geometric.nn.conv.GraphConv,
+        gnn_kwargs: dict = {},
+        self_loops: bool = False,
+        edge_radius: float = 1.0,
+        pos_dim: int = 2,
     ) -> None:
         self.rollout_horizon = rollout_horizon
         self.model_train_freq = model_train_freq
@@ -351,7 +419,21 @@ class _MbpoWorldModelMixin:
         self.warmup_steps = warmup_steps
         self.save_world_model_path = save_world_model_path
         self.save_world_model_interval = save_world_model_interval
-        self._dynamics: Dict[str, List[_DynamicsModel]] = {}
+        # GNN-specific parameters
+        self.topology = topology
+        # Convert string class name to actual class if needed (e.g., from YAML config)
+        if isinstance(gnn_class, str):
+            self.gnn_class = _class_from_name(gnn_class)
+        else:
+            self.gnn_class = gnn_class
+        self.gnn_kwargs = gnn_kwargs if gnn_kwargs is not None else {}
+        self.self_loops = self_loops
+        self.edge_radius = edge_radius
+        self.pos_dim = pos_dim
+
+        # Always use GNN dynamics
+        self.gnn_dynamics = True
+        self._dynamics: Dict[str, List[_GNNDynamicsModel]] = {}
         self._dyn_optimizers: Dict[str, List[torch.optim.Optimizer]] = {}
         self._model_losses: Dict[str, torch.Tensor] = {}
         self._train_steps: Dict[str, int] = {}
@@ -383,10 +465,10 @@ class _MbpoWorldModelMixin:
                 reward_dim_out = 1
                 done_dim_out = 1
 
-            models: List[_DynamicsModel] = []
+            models: List[_GNNDynamicsModel] = []
             opts: List[torch.optim.Optimizer] = []
             for _ in range(self.ensemble_size):
-                model = _DynamicsModel(
+                model = _GNNDynamicsModel(
                     input_dim=dyn_input_dim,
                     next_obs_dim=next_obs_dim_out,
                     reward_dim=reward_dim_out,
@@ -396,6 +478,14 @@ class _MbpoWorldModelMixin:
                     stochastic=self.stochastic_dynamics,
                     min_log_var=self.min_log_var,
                     max_log_var=self.max_log_var,
+                    topology=self.topology,
+                    gnn_class=self.gnn_class,
+                    gnn_kwargs=self.gnn_kwargs,
+                    n_agents=n_agents,
+                    self_loops=self.self_loops,
+                    edge_radius=self.edge_radius,
+                    pos_dim=self.pos_dim,
+                    device=self.device,
                 ).to(self.device)
                 models.append(model)
                 opts.append(torch.optim.Adam(model.parameters(), lr=self.model_lr))
@@ -419,35 +509,25 @@ class _MbpoWorldModelMixin:
         self._last_save_step: Dict[str, int] = {group: 0 for group in self.group_map.keys()}
 
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
-        # Ensure the synthetic buffer exists (created via get_replay_buffer()).
-        # We don't create buffers here to avoid touching Experiment setup logic.
-        synth_buf = getattr(self, "_synthetic_replay_buffers", {}).get(group, None)
-        if synth_buf is not None and hasattr(synth_buf, "empty"):
-            # Synthetic rollouts are per-iteration; clear at the start of the step.
-            synth_buf.empty()
-
         batch = super().process_batch(group, batch)
         flat_batch = batch.reshape(-1) if not self.has_rnn else batch
 
         self._train_steps[group] += 1
         if self._train_steps[group] % self.model_train_freq == 0:
-            # self._train_dynamics(group, flat_batch)
+            self._train_dynamics(group, flat_batch)
             if self._train_steps[group] > self.warmup_steps:
-                pass
-                # synthetic = self._generate_model_rollouts(group, flat_batch)
-                # if synthetic is not None and synthetic.numel() > 0:
-                #     synthetic = super().process_batch(group, synthetic)
-                #     if not self.has_rnn:
-                #         synthetic = synthetic.reshape(-1)
-                #         # Store synthetic rollouts in the dedicated buffer.
-                #         synth_buf = getattr(self, "_synthetic_replay_buffers", {}).get(
-                #             group, None
-                #         )
-                #         if synth_buf is not None:
-                #             synth_buf.extend(synthetic.to(synth_buf.storage.device))
-                #     else:
-                #         # RNN batches have sequence structure; mixing is not supported yet.
-                #         pass
+                synthetic = self._generate_model_rollouts(group, flat_batch)
+                if synthetic is not None and synthetic.numel() > 0:
+                    synthetic = super().process_batch(group, synthetic)
+                    if not self.has_rnn:
+                        synthetic = synthetic.reshape(-1)
+                    # Mix synthetic transitions into training by returning an augmented batch.
+                    # The Experiment loop will extend the replay buffer with whatever we return.
+                    if not self.has_rnn:
+                        batch = torch.cat([batch.reshape(-1), synthetic], dim=0)
+                    else:
+                        # RNN batches have sequence structure; mixing is not supported yet.
+                        pass
             
             # Auto-save world model if path is specified and interval condition is met
             # Save once per training step (check all groups, use minimum step)
@@ -693,9 +773,7 @@ class _MbpoWorldModelMixin:
         if elites is None or elites.numel() == 0:
             elites = torch.arange(self.ensemble_size, device=self.device)
 
-        # Inference: sample a random ensemble member *per transition* (per batch element),
-        # similar to MBPO/PETS-style rollouts. The ensemble mean is only used conceptually
-        # for training/targets; rollouts come from individual models.
+        # Compute outputs for elite models, then sample one model per transition.
         mu_next_list = []
         lv_delta_list = []
         mu_rew_list = []
@@ -717,24 +795,27 @@ class _MbpoWorldModelMixin:
         lv_rew_s = torch.stack(lv_rew_list, dim=0)
         done_logit_s = torch.stack(done_logit_list, dim=0)
 
+        # Select which elite model to use per sample (epistemic uncertainty)
         n_elites = mu_next_s.shape[0]
         bsz = mu_next_s.shape[1]
         model_idx = torch.randint(0, n_elites, (bsz,), device=mu_next_s.device)
         batch_idx = torch.arange(bsz, device=mu_next_s.device)
 
+        mu_next = mu_next_s[model_idx, batch_idx]
+        lv_delta = lv_delta_s[model_idx, batch_idx]
+        mu_rew = mu_rew_s[model_idx, batch_idx]
+        lv_rew = lv_rew_s[model_idx, batch_idx]
+        done_logit = done_logit_s[model_idx, batch_idx]
+
         # Sample (aleatoric uncertainty)
         if self.stochastic_dynamics:
-            std_next_s = torch.exp(0.5 * lv_delta_s)
-            std_rew_s = torch.exp(0.5 * lv_rew_s)
-            next_obs_flat_s = torch.normal(mu_next_s, std_next_s)
-            reward_flat_s = torch.normal(mu_rew_s, std_rew_s)
+            std_next = torch.exp(0.5 * lv_delta)
+            std_rew = torch.exp(0.5 * lv_rew)
+            next_obs_flat = torch.normal(mu_next, std_next)
+            reward_flat = torch.normal(mu_rew, std_rew)
         else:
-            next_obs_flat_s = mu_next_s
-            reward_flat_s = mu_rew_s
-
-        next_obs_flat = next_obs_flat_s[model_idx, batch_idx]
-        reward_flat = reward_flat_s[model_idx, batch_idx]
-        done_logit = done_logit_s[model_idx, batch_idx]
+            next_obs_flat = mu_next
+            reward_flat = mu_rew
 
         if self.centralized_dynamics:
             next_obs = next_obs_flat.reshape(obs.shape)
@@ -751,9 +832,6 @@ class _MbpoWorldModelMixin:
         self, group: str, flat_batch: TensorDictBase, sample_size: int
     ) -> Optional[TensorDictBase]:
         buffer = self.experiment.replay_buffers[group]
-        # If the replay buffer is wrapped (MBPO real+synthetic), sample starts from real only.
-        if hasattr(buffer, "_real"):
-            buffer = buffer._real
         if len(buffer) > 0:
             try:
                 start = buffer.sample(sample_size).to(self.device)
@@ -1028,11 +1106,11 @@ class _MbpoWorldModelMixin:
                     self._elite_indices[group] = indices.to(self.device)
 
 
-class MbpoMasac(_MbpoWorldModelMixin, Masac):
-    """Model-Based Policy Optimisation (MBPO) built on top of MASAC.
+class Gmpo(_GmpoWorldModelMixin, Masac):
+    """GNN-based Model-Based Policy Optimisation (GNN-MBPO) built on top of MASAC.
 
     This implementation keeps MASAC losses/policies and augments training with a
-    learned ensemble dynamics model that generates short synthetic rollouts,
+    learned GNN-based ensemble dynamics model that generates short synthetic rollouts,
     mixed into the replay buffer.
     """
 
@@ -1057,10 +1135,17 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
         save_world_model_interval: Optional[int] = None,
+        # GNN-specific parameters
+        topology: str = "full",
+        gnn_class: Optional[Type] = None,
+        gnn_kwargs: Optional[dict] = None,
+        self_loops: bool = False,
+        edge_radius: float = 1.0,
+        pos_dim: int = 2,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self._mbpo_init(
+        self._gmpo_init(
             rollout_horizon=rollout_horizon,
             model_train_freq=model_train_freq,
             ensemble_size=ensemble_size,
@@ -1080,6 +1165,12 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
             load_world_model_strict=load_world_model_strict,
             save_world_model_path=save_world_model_path,
             save_world_model_interval=save_world_model_interval,
+            topology=topology,
+            gnn_class=gnn_class,
+            gnn_kwargs=gnn_kwargs,
+            self_loops=self_loops,
+            edge_radius=edge_radius,
+            pos_dim=pos_dim,
         )
 
     #############################
@@ -1100,10 +1191,10 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         return super()._get_policy_for_collection(policy_for_loss, group, continuous)
 
 
-class MbpoMappo(_MbpoWorldModelMixin, Mappo):
-    """Model-Based Policy Optimisation (MBPO) built on top of MAPPO.
+class GmpoMappo(_GmpoWorldModelMixin, Mappo):
+    """GNN-based Model-Based Policy Optimisation (GNN-MBPO) built on top of MAPPO.
 
-    Note: MAPPO is on-policy; MBPO-style synthetic rollouts will be mixed into the
+    Note: MAPPO is on-policy; GNN-MBPO-style synthetic rollouts will be mixed into the
     on-policy replay buffer used for PPO updates in BenchMARL.
     """
 
@@ -1128,10 +1219,17 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
         save_world_model_interval: Optional[int] = None,
+        # GNN-specific parameters
+        topology: str = "full",
+        gnn_class: Optional[Type] = None,
+        gnn_kwargs: Optional[dict] = None,
+        edge_radius: float = 1.0,
+        pos_dim: int = 2,
+        self_loops: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self._mbpo_init(
+        self._gmpo_init(
             rollout_horizon=rollout_horizon,
             model_train_freq=model_train_freq,
             ensemble_size=ensemble_size,
@@ -1151,16 +1249,18 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
             load_world_model_strict=load_world_model_strict,
             save_world_model_path=save_world_model_path,
             save_world_model_interval=save_world_model_interval,
+            topology=topology,
+            gnn_class=gnn_class,
+            gnn_kwargs=gnn_kwargs,
+            edge_radius=edge_radius,
+            pos_dim=pos_dim,
+            self_loops=self_loops,
         )
 
 
-# Backwards-compatible name: default MBPO remains MASAC-based.
-Mbpo = MbpoMasac
-
-
 @dataclass
-class MbpoConfig(MasacConfig):
-    """Configuration dataclass for :class:`~benchmarl.algorithms.MbpoMasac`."""
+class GmpoConfig(MasacConfig):
+    """Configuration dataclass for :class:`~benchmarl.algorithms.Gmpo`."""
 
     rollout_horizon: int = MISSING
     model_train_freq: int = MISSING
@@ -1181,10 +1281,17 @@ class MbpoConfig(MasacConfig):
     load_world_model_strict: bool = True
     save_world_model_path: Optional[str] = None
     save_world_model_interval: Optional[int] = None
+    # GNN-specific parameters
+    topology: str = "full"
+    gnn_class: Optional[Any] = None  # Type annotation changed to Any for OmegaConf compatibility
+    gnn_kwargs: Optional[dict] = None
+    edge_radius: float = 1.0
+    pos_dim: int = 2
+    self_loops: bool = False
 
     @staticmethod
     def associated_class() -> Type[Masac]:
-        return MbpoMasac
+        return Gmpo
 
     @staticmethod
     def supports_continuous_actions() -> bool:
@@ -1204,8 +1311,8 @@ class MbpoConfig(MasacConfig):
 
 
 @dataclass
-class MbpoMappoConfig(MappoConfig):
-    """Configuration dataclass for :class:`~benchmarl.algorithms.MbpoMappo`."""
+class GmpoMappoConfig(MappoConfig):
+    """Configuration dataclass for :class:`~benchmarl.algorithms.GmpoMappo`."""
 
     rollout_horizon: int = MISSING
     model_train_freq: int = MISSING
@@ -1226,10 +1333,17 @@ class MbpoMappoConfig(MappoConfig):
     load_world_model_strict: bool = True
     save_world_model_path: Optional[str] = None
     save_world_model_interval: Optional[int] = None
+    # GNN-specific parameters
+    topology: str = "full"
+    gnn_class: Optional[Any] = None  # Type annotation changed to Any for OmegaConf compatibility
+    gnn_kwargs: Optional[dict] = None
+    edge_radius: float = 1.0
+    pos_dim: int = 2
+    self_loops: bool = False
 
     @staticmethod
     def associated_class() -> Type[Mappo]:
-        return MbpoMappo
+        return GmpoMappo
 
     @staticmethod
     def on_policy() -> bool:
