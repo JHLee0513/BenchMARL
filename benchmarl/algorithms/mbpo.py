@@ -50,6 +50,7 @@ class _MixedReplayBuffer:
         self._synthetic = synthetic
         self._get_real_ratio = get_real_ratio
         self._on_policy = on_policy
+        self._last_sample_n_real: Optional[int] = None
 
     @property
     def storage(self):
@@ -90,6 +91,9 @@ class _MixedReplayBuffer:
     def update_tensordict_priority(self, data: TensorDictBase):
         # Priorities apply to the real buffer only.
         if hasattr(self._real, "update_tensordict_priority"):
+            n_real = self._last_sample_n_real
+            if n_real is not None:
+                return self._real.update_tensordict_priority(data[:n_real])
             return self._real.update_tensordict_priority(data)
 
     def _safe_sample(self, buffer: ReplayBuffer, n: int) -> Optional[TensorDictBase]:
@@ -117,29 +121,122 @@ class _MixedReplayBuffer:
 
         rr = float(self._get_real_ratio() or 1.0)
         rr = min(max(rr, 0.0), 1.0)
-        n_real = max(1, min(total, int(math.ceil(total * rr))))
-        n_synth = max(0, total - n_real)
+        if not self._on_policy:
+            # Off-policy: keep previous semantics (fixed total size with rr fraction real).
+            n_real = max(1, min(total, int(math.ceil(total * rr))))
+            n_synth = max(0, total - n_real)
+            self._last_sample_n_real = n_real
+            if n_synth <= 0:
+                return self._safe_sample(self._real, total)
+            try:
+                synth_len = len(self._synthetic)
+            except Exception:
+                synth_len = 0
+            if synth_len <= 0:
+                return self._safe_sample(self._real, total)
+            n_synth = min(n_synth, synth_len)
+            real_td = self._safe_sample(self._real, total - n_synth)
+            synth_td = self._safe_sample(self._synthetic, n_synth)
+            if synth_td is None:
+                return real_td
+            return torch.cat([real_td, synth_td], dim=0)
 
-        # If no synthetic is needed, behave exactly like the real buffer.
-        if n_synth <= 0:
-            return self._safe_sample(self._real, total)
+        # On-policy: keep the requested number of *real* samples fixed, and add synthetic on top.
+        n_real = total
+        n_synth_target = int(math.ceil(float(n_real) * (1.0 - rr)))
 
-        # If synthetic buffer is empty, fall back to real-only in a *single* call
-        # (avoids changing SamplerWithoutReplacement behavior).
+        # If no synthetic is requested (rr=1), behave exactly like the real buffer.
+        if n_synth_target <= 0:
+            self._last_sample_n_real = n_real
+            return self._safe_sample(self._real, n_real)
+
         try:
             synth_len = len(self._synthetic)
         except Exception:
             synth_len = 0
         if synth_len <= 0:
-            return self._safe_sample(self._real, total)
+            # No synthetic available yet (e.g., warmup): keep MAPPO-equivalent sampling.
+            self._last_sample_n_real = n_real
+            return self._safe_sample(self._real, n_real)
 
-        n_synth = min(n_synth, synth_len)
-        # One call to real buffer, one call to synthetic buffer.
-        real_td = self._safe_sample(self._real, total - n_synth)
-        synth_td = self._safe_sample(self._synthetic, n_synth)
+        n_synth = min(n_synth_target, synth_len)
+        real_td = self._safe_sample(self._real, n_real)
+        synth_td = self._safe_sample(self._synthetic, n_synth) if n_synth > 0 else None
+
+        self._last_sample_n_real = n_real
         if synth_td is None:
             return real_td
         return torch.cat([real_td, synth_td], dim=0)
+
+
+class _DynamicsTrainBuffer:
+    """Simple ring buffer for TensorDicts used to train the dynamics model.
+
+    Key design goal: sampling must NOT consume the global torch RNG (to keep on-policy
+    training identical to model-free baselines until synthetic rollouts are used).
+    """
+
+    def __init__(self, capacity: int, device: torch.device):
+        self.capacity = max(1, int(capacity))
+        self.device = device
+        self._storage: Optional[TensorDictBase] = None
+        self._cursor: int = 0
+        self._len: int = 0
+
+    def __len__(self) -> int:
+        return self._len
+
+    def extend(self, td: TensorDictBase) -> None:
+        if td is None or td.numel() == 0:
+            return
+        td = td.detach()
+
+        # Ensure leading dimension exists.
+        if td.batch_size is None or len(td.batch_size) == 0:
+            td = td.reshape(-1)
+
+        n = int(td.batch_size[0])
+        if n <= 0:
+            return
+
+        if self._storage is None:
+            # Allocate storage with fixed capacity.
+            self._storage = td[: min(n, self.capacity)].to(self.device)
+            # If n < capacity, expand storage by cloning schema and resizing batch dim.
+            if self._storage.batch_size[0] < self.capacity:
+                # Create empty storage by repeating first element then overwriting.
+                first = self._storage[:1]
+                self._storage = torch.cat(
+                    [first.expand(self.capacity), self._storage], dim=0
+                )[: self.capacity]
+            self._cursor = 0
+            self._len = 0
+
+        # Write in chunks to handle wrap-around.
+        start = 0
+        while start < n:
+            remaining = n - start
+            space_to_end = self.capacity - self._cursor
+            k = min(remaining, space_to_end)
+            chunk = td[start : start + k].to(self.device)
+            self._storage[self._cursor : self._cursor + k] = chunk
+            self._cursor = (self._cursor + k) % self.capacity
+            self._len = min(self.capacity, self._len + k)
+            start += k
+
+    def sample(self, batch_size: int, *, generator: Optional[torch.Generator]) -> TensorDictBase:
+        if self._storage is None or self._len <= 0:
+            raise RuntimeError("DynamicsTrainBuffer is empty")
+        batch_size = max(1, int(batch_size))
+        # Sample indices using the provided generator on CPU to avoid global RNG.
+        idx = torch.randint(
+            0,
+            self._len,
+            (batch_size,),
+            device="cpu",
+            generator=generator,
+        ).to(self.device)
+        return self._storage[idx]
 
 
 class _DynamicsModel(nn.Module):
@@ -233,9 +330,8 @@ class _MbpoWorldModelMixin:
         base_memory_size = self.experiment_config.replay_buffer_memory_size(self.on_policy)
         rr = float(getattr(self, "real_ratio", 1.0))
         rr = min(max(rr, 0.0), 1.0)
-        horizon = max(0, int(getattr(self, "rollout_horizon", 0)))
-        synthetic_multiplier = (1.0 - rr) * float(horizon)
-        synthetic_memory_size = int(math.ceil(base_memory_size * max(0.0, synthetic_multiplier)))
+        # New semantics: synthetic count per iteration ~= (1-real_ratio) * N_real.
+        synthetic_memory_size = int(math.ceil(base_memory_size * max(0.0, (1.0 - rr))))
         synthetic_memory_size = max(1, synthetic_memory_size)
 
         synthetic_buffer = self._get_synthetic_rollout_replay_buffer(
@@ -257,6 +353,9 @@ class _MbpoWorldModelMixin:
     def replay_buffer_memory_size_multiplier(self) -> float:
         # Do NOT inflate the main replay buffer: synthetic rollouts are stored separately.
         return 1.0
+
+    def _get_dynamics_training_buffer(self, memory_size: int) -> _DynamicsTrainBuffer:
+        return _DynamicsTrainBuffer(capacity=memory_size, device=torch.device(self.device))
 
     def _get_synthetic_rollout_replay_buffer(
         self, group: str, memory_size: int, transforms: Optional[List[Transform]] = None
@@ -309,6 +408,7 @@ class _MbpoWorldModelMixin:
         model_lr: float,
         model_hidden_size: int,
         model_num_layers: int,
+        training_iterations: int = 0,
         centralized_dynamics: bool = False,
         stochastic_dynamics: bool = True,
         n_elites: Optional[int] = None,
@@ -329,6 +429,7 @@ class _MbpoWorldModelMixin:
         self.model_lr = model_lr
         self.model_hidden_size = model_hidden_size
         self.model_num_layers = model_num_layers
+        self.training_iterations = max(0, int(training_iterations))
         self.centralized_dynamics = centralized_dynamics
         self.stochastic_dynamics = stochastic_dynamics
         self.n_elites = n_elites
@@ -342,6 +443,7 @@ class _MbpoWorldModelMixin:
         self._model_losses: Dict[str, torch.Tensor] = {}
         self._train_steps: Dict[str, int] = {}
         self._elite_indices: Dict[str, torch.Tensor] = {}
+        self._dynamics_train_buffers: Dict[str, _DynamicsTrainBuffer] = {}
 
         for group in self.group_map.keys():
             obs_shape = self.observation_spec[group, "observation"].shape
@@ -396,6 +498,15 @@ class _MbpoWorldModelMixin:
                 min(self.ensemble_size, self.n_elites or self.ensemble_size),
                 device=self.device,
             )
+
+            # Dedicated dynamics training buffer (keeps history across iterations).
+            # Size: a few iterations worth of on-policy data.
+            # We avoid exposing a new hyperparam for now; adjust multiplier if needed.
+            base_mem = int(self.experiment_config.replay_buffer_memory_size(self.on_policy))
+            dyn_mem = max(base_mem * 10, int(self.model_batch_size) * 10)
+            self._dynamics_train_buffers[group] = self._get_dynamics_training_buffer(
+                memory_size=dyn_mem
+            )
         
         # Load pretrained world model if path is provided
         if load_world_model_path is not None:
@@ -420,25 +531,46 @@ class _MbpoWorldModelMixin:
         batch = super().process_batch(group, batch)
         flat_batch = batch.reshape(-1) if not self.has_rnn else batch
 
+        # Store transitions for dynamics training (do not clear between iterations).
+        # This reduces overfitting to a single on-policy batch.
+        dyn_buf = getattr(self, "_dynamics_train_buffers", {}).get(group, None)
+        if dyn_buf is not None and flat_batch.numel() > 0:
+            try:
+                dyn_buf.extend(flat_batch)
+            except Exception:
+                pass
+
         self._train_steps[group] += 1
         if self._train_steps[group] % self.model_train_freq == 0:
-            self._train_dynamics(group, flat_batch)
+            # Train the dynamics model for multiple iterations, sampling a fresh minibatch each time.
+            dyn_buf = getattr(self, "_dynamics_train_buffers", {}).get(group, None)
+            for _ in range(int(getattr(self, "training_iterations", 0))):
+                if dyn_buf is not None and len(dyn_buf) > 0:
+                    try:
+                        dyn_batch = dyn_buf.sample(
+                            int(getattr(self, "model_batch_size", 256)),
+                            generator=getattr(self, "_world_model_rng", None),
+                        )
+                    except Exception:
+                        dyn_batch = flat_batch
+                else:
+                    dyn_batch = flat_batch
+                self._train_dynamics(group, dyn_batch)
             if self._train_steps[group] > self.warmup_steps:
-                pass
-                # synthetic = self._generate_model_rollouts(group, flat_batch)
-                # if synthetic is not None and synthetic.numel() > 0:
-                #     synthetic = super().process_batch(group, synthetic)
-                #     if not self.has_rnn:
-                #         synthetic = synthetic.reshape(-1)
-                #         # Store synthetic rollouts in the dedicated buffer.
-                #         synth_buf = getattr(self, "_synthetic_replay_buffers", {}).get(
-                #             group, None
-                #         )
-                #         if synth_buf is not None:
-                #             synth_buf.extend(synthetic.to(synth_buf.storage.device))
-                #     else:
-                #         # RNN batches have sequence structure; mixing is not supported yet.
-                #         pass
+                synthetic = self._generate_model_rollouts(group, flat_batch)
+                if synthetic is not None and synthetic.numel() > 0:
+                    synthetic = super().process_batch(group, synthetic)
+                    if not self.has_rnn:
+                        synthetic = synthetic.reshape(-1)
+                        # Store synthetic rollouts in the dedicated buffer.
+                        synth_buf = getattr(self, "_synthetic_replay_buffers", {}).get(
+                            group, None
+                        )
+                        if synth_buf is not None:
+                            synth_buf.extend(synthetic.to(synth_buf.storage.device))
+                    else:
+                        # RNN batches have sequence structure; mixing is not supported yet.
+                        pass
             
             # Auto-save world model if path is specified and interval condition is met
             # Save once per training step (check all groups, use minimum step)
@@ -572,6 +704,20 @@ class _MbpoWorldModelMixin:
 
         # Uncertainty metrics on the full (non-bootstrapped) batch
         with torch.no_grad():
+            def _pearsonr(x: torch.Tensor, y: torch.Tensor) -> float:
+                """Compute Pearson correlation between 1D tensors; returns 0.0 if ill-defined."""
+                x = x.flatten().to(torch.float32)
+                y = y.flatten().to(torch.float32)
+                n = min(x.numel(), y.numel())
+                if n <= 1:
+                    return 0.0
+                x = x[:n]
+                y = y[:n]
+                x = x - x.mean()
+                y = y - y.mean()
+                denom = (x.pow(2).mean().sqrt() * y.pow(2).mean().sqrt()).clamp_min(1e-12)
+                return float((x.mul(y).mean() / denom).detach().cpu().item())
+
             mu_next_all = []
             mu_rew_all = []
             lv_delta_all = []
@@ -639,6 +785,65 @@ class _MbpoWorldModelMixin:
             pred_reward_min = (mean_pred_flat - std_pred_flat).mean().detach().item()
             pred_reward_max = (mean_pred_flat + std_pred_flat).mean().detach().item()
 
+            # --- Optimism diagnostics for reward predictions ---
+            # Signed error per sample
+            signed_error = mean_pred_flat - reward_flat_for_bias
+            over_mask = signed_error > 0
+            under_mask = signed_error < 0
+
+            over_rate = over_mask.float().mean().detach().item()
+            under_rate = under_mask.float().mean().detach().item()
+
+            mean_overpred = torch.clamp(signed_error, min=0.0).mean().detach().item()
+            mean_underpred = torch.clamp(-signed_error, min=0.0).mean().detach().item()
+
+            # Lower-confidence-bound optimism: even (pred - std) is above actual.
+            lcb = mean_pred_flat - std_pred_flat
+            lcb_over_rate = (lcb > reward_flat_for_bias).float().mean().detach().item()
+            lcb_over_mean = torch.clamp(lcb - reward_flat_for_bias, min=0.0).mean().detach().item()
+
+            # Tail metrics: focus on high predicted reward and high uncertainty regions.
+            n = mean_pred_flat.numel()
+            k = max(1, int(0.1 * n))  # top 10%
+
+            top_pred_idx = torch.topk(mean_pred_flat, k=k, largest=True).indices
+            top_pred_bias = signed_error[top_pred_idx].mean().detach().item()
+            top_pred_over_rate = over_mask[top_pred_idx].float().mean().detach().item()
+
+            top_unc_idx = torch.topk(std_pred_flat, k=k, largest=True).indices
+            top_unc_bias = signed_error[top_unc_idx].mean().detach().item()
+            top_unc_over_rate = over_mask[top_unc_idx].float().mean().detach().item()
+
+            # --- Calibration / usefulness of uncertainty ---
+            # Reward: does epistemic uncertainty (std across ensemble) correlate with abs error?
+            reward_unc = std_pred_flat
+            reward_err = abs_error
+            reward_unc_err_pearson = _pearsonr(reward_unc, reward_err)
+
+            # Observation: uncertainty (var across ensemble) vs prediction error (MSE) per sample.
+            obs_mean = mu_next_all.mean(dim=0)  # [n_samples, obs_dim]
+            obs_err = torch.mean((obs_mean - next_obs_flat) ** 2, dim=-1)  # [n_samples]
+            obs_unc = torch.mean(torch.var(mu_next_all, dim=0), dim=-1)  # [n_samples]
+            obs_unc_err_pearson = _pearsonr(obs_unc, obs_err)
+
+            # Done: uncertainty (var of logits) vs BCE error per sample.
+            done_logit_mean = done_logit_all.mean(dim=0)  # [n_samples, done_dim]
+            done_prob_mean = torch.sigmoid(done_logit_mean)
+            done_target = done_flat.float()
+            # Reduce to per-sample scalar.
+            done_err = F.binary_cross_entropy(done_prob_mean, done_target, reduction="none")
+            done_err = done_err.mean(dim=-1)
+            done_unc = torch.var(done_logit_all, dim=0).mean(dim=-1)
+            done_unc_err_pearson = _pearsonr(done_unc, done_err)
+
+            # Log means for interpretability
+            reward_unc_mean = float(reward_unc.mean().detach().cpu().item()) if reward_unc.numel() else 0.0
+            reward_err_mean = float(reward_err.mean().detach().cpu().item()) if reward_err.numel() else 0.0
+            obs_unc_mean = float(obs_unc.mean().detach().cpu().item()) if obs_unc.numel() else 0.0
+            obs_err_mean = float(obs_err.mean().detach().cpu().item()) if obs_err.numel() else 0.0
+            done_unc_mean = float(done_unc.mean().detach().cpu().item()) if done_unc.numel() else 0.0
+            done_err_mean = float(done_err.mean().detach().cpu().item()) if done_err.numel() else 0.0
+
         # Update elite indices (lowest loss are best)
         n_elites = self.n_elites or self.ensemble_size
         n_elites = max(1, min(int(n_elites), self.ensemble_size))
@@ -670,6 +875,27 @@ class _MbpoWorldModelMixin:
                 f"world_model/{group}/bias/reward_mean_abs_error": mean_abs_error,
                 f"world_model/{group}/bias/reward_range_min": pred_reward_min,
                 f"world_model/{group}/bias/reward_range_max": pred_reward_max,
+                # Reward optimism diagnostics
+                f"world_model/{group}/optimism/reward_over_rate": over_rate,
+                f"world_model/{group}/optimism/reward_under_rate": under_rate,
+                f"world_model/{group}/optimism/reward_mean_overpred": mean_overpred,
+                f"world_model/{group}/optimism/reward_mean_underpred": mean_underpred,
+                f"world_model/{group}/optimism/reward_lcb_over_rate": lcb_over_rate,
+                f"world_model/{group}/optimism/reward_lcb_over_mean": lcb_over_mean,
+                f"world_model/{group}/optimism/top10p_pred_bias": top_pred_bias,
+                f"world_model/{group}/optimism/top10p_pred_over_rate": top_pred_over_rate,
+                f"world_model/{group}/optimism/top10p_unc_bias": top_unc_bias,
+                f"world_model/{group}/optimism/top10p_unc_over_rate": top_unc_over_rate,
+                # Uncertainty calibration: correlation between epistemic uncertainty and error
+                f"world_model/{group}/calibration/reward_unc_abs_err_pearson": reward_unc_err_pearson,
+                f"world_model/{group}/calibration/obs_unc_mse_pearson": obs_unc_err_pearson,
+                f"world_model/{group}/calibration/done_unc_bce_pearson": done_unc_err_pearson,
+                f"world_model/{group}/calibration/reward_unc_mean": reward_unc_mean,
+                f"world_model/{group}/calibration/reward_abs_err_mean": reward_err_mean,
+                f"world_model/{group}/calibration/obs_unc_mean": obs_unc_mean,
+                f"world_model/{group}/calibration/obs_mse_mean": obs_err_mean,
+                f"world_model/{group}/calibration/done_unc_mean": done_unc_mean,
+                f"world_model/{group}/calibration/done_bce_mean": done_err_mean,
                 f"world_model/{group}/ensemble_size": self.ensemble_size,
                 f"world_model/{group}/n_elites": n_elites,
             }
@@ -766,8 +992,16 @@ class _MbpoWorldModelMixin:
     def _generate_model_rollouts(
         self, group: str, flat_batch: TensorDictBase
     ) -> Optional[TensorDictBase]:
-        model_batch = max(1, int(float(flat_batch.batch_size[0]) * (1.0 - self.real_ratio)))
-        start = self._sample_start_states(group, flat_batch, model_batch)
+        rr = float(getattr(self, "real_ratio", 1.0))
+        rr = min(max(rr, 0.0), 1.0)
+        target_synth = int(math.ceil(float(flat_batch.batch_size[0]) * (1.0 - rr)))
+        if target_synth <= 0:
+            return None
+
+        horizon = max(1, int(getattr(self, "rollout_horizon", 1)))
+        start_states = max(1, int(math.ceil(target_synth / float(horizon))))
+
+        start = self._sample_start_states(group, flat_batch, start_states)
         if start is None or start.numel() == 0:
             return None
 
@@ -792,7 +1026,7 @@ class _MbpoWorldModelMixin:
         else:
             ep_rew = torch.zeros((*batch_dims, n_agents, 1), device=self.device, dtype=torch.float32)
 
-        for _ in range(self.rollout_horizon):
+        for _ in range(horizon):
             td_in = TensorDict({}, batch_size=batch_dims, device=self.device)
             td_in.set(
                 group,
@@ -887,7 +1121,11 @@ class _MbpoWorldModelMixin:
 
         if not rollouts:
             return None
-        return torch.cat(rollouts, dim=0)
+        out = torch.cat(rollouts, dim=0)
+        # Enforce target synthetic dataset size for this iteration.
+        if out.shape[0] > target_synth:
+            out = out[:target_synth]
+        return out
 
     def save_world_model(self, filepath: str) -> None:
         """
@@ -1046,6 +1284,7 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         model_lr: float,
         model_hidden_size: int,
         model_num_layers: int,
+        training_iterations: int = 0,
         centralized_dynamics: bool = False,
         stochastic_dynamics: bool = True,
         n_elites: Optional[int] = None,
@@ -1069,6 +1308,7 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
             model_lr=model_lr,
             model_hidden_size=model_hidden_size,
             model_num_layers=model_num_layers,
+            training_iterations=training_iterations,
             centralized_dynamics=centralized_dynamics,
             stochastic_dynamics=stochastic_dynamics,
             n_elites=n_elites,
@@ -1117,6 +1357,7 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
         model_lr: float,
         model_hidden_size: int,
         model_num_layers: int,
+        training_iterations: int = 0,
         centralized_dynamics: bool = False,
         stochastic_dynamics: bool = True,
         n_elites: Optional[int] = None,
@@ -1140,6 +1381,7 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
             model_lr=model_lr,
             model_hidden_size=model_hidden_size,
             model_num_layers=model_num_layers,
+            training_iterations=training_iterations,
             centralized_dynamics=centralized_dynamics,
             stochastic_dynamics=stochastic_dynamics,
             n_elites=n_elites,
@@ -1170,6 +1412,7 @@ class MbpoConfig(MasacConfig):
     model_lr: float = MISSING
     model_hidden_size: int = MISSING
     model_num_layers: int = MISSING
+    training_iterations: int = 0
     centralized_dynamics: bool = False
     stochastic_dynamics: bool = True
     n_elites: Optional[int] = None
@@ -1215,6 +1458,7 @@ class MbpoMappoConfig(MappoConfig):
     model_lr: float = MISSING
     model_hidden_size: int = MISSING
     model_num_layers: int = MISSING
+    training_iterations: int = 0
     centralized_dynamics: bool = False
     stochastic_dynamics: bool = True
     n_elites: Optional[int] = None
