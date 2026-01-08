@@ -5,6 +5,7 @@
 #
 
 import collections
+import argparse
 import importlib
 import json
 from os import walk
@@ -249,27 +250,106 @@ class Plotting:
 
 
 if __name__ == "__main__":
-    raw_dict = get_raw_dict_from_multirun_folder(
-        # multirun_folder="/home/joonho/BenchMARL/multirun/2025-12-16/17-34-03"
-        multirun_folder="/home/joonho/BenchMARL/multirun/2025-12-17/15-51-10"
+    parser = argparse.ArgumentParser(
+        description="Process BenchMARL evaluation results and optionally save/show visualizations."
     )
+    parser.add_argument(
+        "--multirun-folder",
+        type=str,
+        required=True,
+        help="Absolute path to the Hydra multirun folder containing result JSONs.",
+    )
+    parser.add_argument(
+        "--env-name",
+        type=str,
+        default="vmas",
+        help="Environment name to aggregate (default: vmas).",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="navigation",
+        help="Task name for the task-level plot (default: navigation).",
+    )
+    parser.add_argument(
+        "--save-viz",
+        action="store_true",
+        help="Save generated figures to disk.",
+    )
+    parser.add_argument(
+        "--show-viz",
+        action="store_true",
+        help="Show figures as pop-ups.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory to save figures (default: <multirun_folder>/figures).",
+    )
+
+    args = parser.parse_args()
+
+    raw_dict = get_raw_dict_from_multirun_folder(multirun_folder=args.multirun_folder)
     processed_data = Plotting.process_data(raw_dict)
     (
         environment_comparison_matrix,
         sample_efficiency_matrix,
-    ) = Plotting.create_matrices(processed_data, env_name="vmas")
+    ) = Plotting.create_matrices(processed_data, env_name=args.env_name)
 
+    # Ensure output directory exists if saving is enabled; default is <multirun_folder>/figures
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir is not None
+        else Path(args.multirun_folder) / "figures"
+    )
+    if args.save_viz:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Environment-level plots
     Plotting.performance_profile_figure(
         environment_comparison_matrix=environment_comparison_matrix
     )
+    if args.save_viz:
+        plt.gcf().savefig(
+            output_dir / f"performance_profile_{args.env_name}.png",
+            bbox_inches="tight",
+            dpi=300,
+        )
+
     Plotting.aggregate_scores(
         environment_comparison_matrix=environment_comparison_matrix
     )
+    if args.save_viz:
+        plt.gcf().savefig(
+            output_dir / f"aggregate_scores_{args.env_name}.png",
+            bbox_inches="tight",
+            dpi=300,
+        )
+
     Plotting.environemnt_sample_efficiency_curves(
         sample_effeciency_matrix=sample_efficiency_matrix
     )
+    if args.save_viz:
+        plt.gcf().savefig(
+            output_dir / f"environment_sample_efficiency_{args.env_name}.png",
+            bbox_inches="tight",
+            dpi=300,
+        )
 
+    # Task-level plot
     Plotting.task_sample_efficiency_curves(
-        processed_data=processed_data, env="vmas", task="navigation"
+        processed_data=processed_data, env=args.env_name, task=args.task
     )
-    plt.show()
+    if args.save_viz:
+        plt.gcf().savefig(
+            output_dir / f"task_sample_efficiency_{args.env_name}_{args.task}.png",
+            bbox_inches="tight",
+            dpi=300,
+        )
+
+    if args.show_viz:
+        plt.show()
+    else:
+        # Close figures to avoid GUI pop-ups or memory growth when not showing
+        plt.close("all")

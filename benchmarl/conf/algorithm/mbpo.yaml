@@ -30,6 +30,11 @@ temperature: 1.0
 model_lr: 0.001
 model_hidden_size: 256
 model_num_layers: 2
+reward_loss_coef: 1.0
+reward_normalize: False
+reward_norm_alpha: 0.01
+reward_norm_eps: 1e-6
+separate_reward_net: False
 stochastic_dynamics: True
 min_log_var: -10.0
 max_log_var: -2.0

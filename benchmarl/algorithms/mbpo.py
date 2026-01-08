@@ -24,6 +24,12 @@ from benchmarl.algorithms.mappo import Mappo, MappoConfig
 from benchmarl.algorithms.masac import Masac, MasacConfig
 from benchmarl.models.common import ModelConfig
 
+try:
+    # Optional: used to detect W&B logger for video logging (same pattern as Logger.log_evaluation).
+    from torchrl.record.loggers.wandb import WandbLogger  # type: ignore
+except Exception:  # pragma: no cover
+    WandbLogger = None  # type: ignore
+
 
 class _MixedReplayBuffer:
     """A thin wrapper that mixes samples from a real and a synthetic replay buffer.
@@ -261,6 +267,7 @@ class _DynamicsModel(nn.Module):
         stochastic: bool,
         min_log_var: float,
         max_log_var: float,
+        separate_reward_net: bool = False,
     ):
         super().__init__()
         layers: List[nn.Module] = []
@@ -273,13 +280,30 @@ class _DynamicsModel(nn.Module):
         assert not stochastic, "Stochastic dynamics are currently disabled on purpose"
 
         self._stochastic = stochastic
+        self._separate_reward_net = bool(separate_reward_net)
         # Bounds used to keep log-variances well-behaved (softplus clamp like PETS/MAMBPO)
         self.register_buffer("_min_log_var", torch.tensor(float(min_log_var)))
         self.register_buffer("_max_log_var", torch.tensor(float(max_log_var)))
 
         # Predict mean(delta_next_obs), mean(reward), and optionally log-variances; plus done logits.
-        self.mu_head = nn.Linear(last_dim, next_obs_dim + reward_dim)
-        self.log_var_head = nn.Linear(last_dim, next_obs_dim + reward_dim)
+        # We keep separate heads for obs vs reward; optionally also separate the trunk for reward.
+        self.delta_mu_head = nn.Linear(last_dim, next_obs_dim)
+        self.delta_log_var_head = nn.Linear(last_dim, next_obs_dim)
+
+        if self._separate_reward_net:
+            r_layers: List[nn.Module] = []
+            r_last = input_dim
+            for _ in range(num_layers):
+                r_layers += [nn.Linear(r_last, hidden_size), nn.ReLU()]
+                r_last = hidden_size
+            self.reward_net = nn.Sequential(*r_layers)
+            reward_last_dim = r_last
+        else:
+            self.reward_net = None
+            reward_last_dim = last_dim
+
+        self.rew_mu_head = nn.Linear(reward_last_dim, reward_dim)
+        self.rew_log_var_head = nn.Linear(reward_last_dim, reward_dim)
         self.done_head = nn.Linear(last_dim, done_dim)
 
         self._next_obs_dim = next_obs_dim
@@ -291,33 +315,502 @@ class _DynamicsModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x = torch.cat([obs_flat, action_flat], dim=-1)
         feat = self.net(x)
-        mu = self.mu_head(feat)
-        log_var = self.log_var_head(feat)
+        delta_mu = self.delta_mu_head(feat)
+        delta_log_var = self.delta_log_var_head(feat)
+
+        if self.reward_net is None:
+            r_feat = feat
+        else:
+            r_feat = self.reward_net(x)
+        rew_mu = self.rew_mu_head(r_feat)
+        rew_log_var = self.rew_log_var_head(r_feat)
+
         done_logit = self.done_head(feat)
 
         # Softplus-based clamp to [min_log_var, max_log_var]
         max_lv = self._max_log_var
         min_lv = self._min_log_var
-        log_var = max_lv - F.softplus(max_lv - log_var)
-        log_var = min_lv + F.softplus(log_var - min_lv)
+        delta_log_var = max_lv - F.softplus(max_lv - delta_log_var)
+        delta_log_var = min_lv + F.softplus(delta_log_var - min_lv)
+        rew_log_var = max_lv - F.softplus(max_lv - rew_log_var)
+        rew_log_var = min_lv + F.softplus(rew_log_var - min_lv)
 
         if not self._stochastic:
-            log_var = log_var * 0.0
+            delta_log_var = delta_log_var * 0.0
+            rew_log_var = rew_log_var * 0.0
 
-        next_obs_end = self._next_obs_dim
-        reward_end = next_obs_end + self._reward_dim
-
-        mu_delta = mu[..., :next_obs_end]
-        mu_rew = mu[..., next_obs_end:reward_end]
-        lv_delta = log_var[..., :next_obs_end]
-        lv_rew = log_var[..., next_obs_end:reward_end]
-
-        mu_next_obs = obs_flat + mu_delta
-        return mu_next_obs, lv_delta, mu_rew, lv_rew, done_logit
+        mu_next_obs = obs_flat + delta_mu
+        return mu_next_obs, delta_log_var, rew_mu, rew_log_var, done_logit
 
 
 class _MbpoWorldModelMixin:
     """MBPO world-model implementation shared across different base algorithms."""
+
+    #############################
+    # World-model debug video
+    #############################
+
+    def _wm_vis_enabled(self) -> bool:
+        return bool(getattr(self, "world_model_debug_video", False))
+
+    def _wm_vis_interval(self) -> int:
+        return max(
+            1, int(getattr(self, "world_model_debug_video_interval", 0) or 1)
+        )
+
+    def _wm_vis_horizon(self) -> int:
+        return max(1, int(getattr(self, "world_model_debug_video_horizon", 0) or 1))
+
+    def _wm_vis_fps(self) -> int:
+        return max(1, int(getattr(self, "world_model_debug_video_fps", 0) or 20))
+
+    def _wm_vis_env_index(self) -> int:
+        return max(0, int(getattr(self, "world_model_debug_video_env_index", 0) or 0))
+
+    def _wm_vis_mode(self) -> str:
+        """Either 'open_loop' (default) or 'closed_loop'."""
+        mode = str(getattr(self, "world_model_debug_video_mode", "open_loop") or "open_loop")
+        mode = mode.strip().lower()
+        if mode not in ("open_loop", "closed_loop"):
+            mode = "open_loop"
+        return mode
+
+    def _wm_vis_xy_indices(self) -> Optional[Tuple[int, int]]:
+        idx = getattr(self, "world_model_debug_video_obs_xy_indices", None)
+        if idx is None:
+            return None
+        try:
+            if isinstance(idx, (list, tuple)) and len(idx) == 2:
+                return (int(idx[0]), int(idx[1]))
+        except Exception:
+            return None
+        return None
+
+    def _wm_vis_should_log(self, group: str) -> bool:
+        if not self._wm_vis_enabled():
+            return False
+        if not hasattr(self, "experiment") or self.experiment is None:
+            return False
+        if not hasattr(self.experiment, "logger") or self.experiment.logger is None:
+            return False
+        step = int(getattr(self, "_train_steps", {}).get(group, 0))
+        return step > 0 and (step % self._wm_vis_interval() == 0)
+
+    def _wm_vis_extract_xy(self, obs: torch.Tensor) -> torch.Tensor:
+        """Extract 2D coordinates from an observation tensor for visualization.
+
+        This is task-dependent: by default we use the first two obs dims, or the
+        indices in `world_model_debug_video_obs_xy_indices` if provided.
+        """
+        xy_idx = self._wm_vis_xy_indices()
+        if xy_idx is not None:
+            i, j = xy_idx
+            if obs.shape[-1] > max(i, j):
+                return torch.stack([obs[..., i], obs[..., j]], dim=-1)
+        if obs.shape[-1] >= 2:
+            return obs[..., :2]
+        z = torch.zeros((*obs.shape[:-1], 2), device=obs.device, dtype=obs.dtype)
+        if obs.shape[-1] == 1:
+            z[..., 0] = obs[..., 0]
+        return z
+
+    def _wm_vis_render_frames(
+        self, *, group: str, traj: TensorDictBase, horizon: int
+    ) -> Optional[List]:
+        """Create RGB frames comparing simulator transitions vs world-model predictions.
+
+        Each frame contains:
+        - left: ground-truth obs_t -> obs_{t+1} (as 2D points/arrows)
+        - right: predicted obs_t -> predicted obs_{t+1} (closed-loop rollout)
+        - bottom: reward curve (true vs predicted) up to current t
+        """
+        try:
+            import numpy as np
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+        except Exception:
+            return None
+
+        keys = traj.keys(True, True)
+        if (group, "observation") not in keys or ("next", group, "observation") not in keys:
+            return None
+        if (group, "action") not in keys:
+            return None
+
+        if not hasattr(traj, "batch_size") or len(traj.batch_size) == 0:
+            return None
+        T = int(traj.batch_size[0])
+        if T <= 0:
+            return None
+
+        horizon = max(1, min(int(horizon), T))
+
+        # Closed-loop state (only used when mode == 'closed_loop').
+        obs_pred: Optional[torch.Tensor] = None
+        if self._wm_vis_mode() == "closed_loop":
+            obs0 = traj[0].get((group, "observation")).to(self.device)
+            obs_pred = obs0.unsqueeze(0) if obs0.dim() == 2 else obs0
+
+        reward_true_hist: List[float] = []
+        reward_pred_hist: List[float] = []
+        frames: List = []
+
+        # Stable limits from ground truth, if possible.
+        xlim = None
+        ylim = None
+        try:
+            all_xy = []
+            for t in range(horizon):
+                o = traj[t].get((group, "observation")).to(self.device)
+                no = traj[t].get(("next", group, "observation")).to(self.device)
+                o = o.unsqueeze(0) if o.dim() == 2 else o
+                no = no.unsqueeze(0) if no.dim() == 2 else no
+                all_xy.append(self._wm_vis_extract_xy(o[0]))
+                all_xy.append(self._wm_vis_extract_xy(no[0]))
+            all_xy = torch.cat(all_xy, dim=0)
+            xmin = float(all_xy[:, 0].min().detach().cpu().item())
+            xmax = float(all_xy[:, 0].max().detach().cpu().item())
+            ymin = float(all_xy[:, 1].min().detach().cpu().item())
+            ymax = float(all_xy[:, 1].max().detach().cpu().item())
+            pad_x = 0.1 * max(1e-6, xmax - xmin)
+            pad_y = 0.1 * max(1e-6, ymax - ymin)
+            xlim = (xmin - pad_x, xmax + pad_x)
+            ylim = (ymin - pad_y, ymax + pad_y)
+        except Exception:
+            pass
+
+        for t in range(horizon):
+            td_t = traj[t]
+            obs_true = td_t.get((group, "observation")).to(self.device)
+            act_true = td_t.get((group, "action")).to(self.device)
+            next_obs_true = td_t.get(("next", group, "observation")).to(self.device)
+            rew_true = td_t.get(("next", group, "reward"), None)
+            if rew_true is None:
+                rew_true = td_t.get(("next", "reward"), None)
+
+            obs_true_b = obs_true.unsqueeze(0) if obs_true.dim() == 2 else obs_true
+            act_true_b = act_true.unsqueeze(0) if act_true.dim() == 2 else act_true
+            next_obs_true_b = (
+                next_obs_true.unsqueeze(0) if next_obs_true.dim() == 2 else next_obs_true
+            )
+
+            # IMPORTANT: to compare fairly, use the SAME starting state as the simulator:
+            # - open_loop: predict from simulator obs_true_b every step
+            # - closed_loop: predict from previous model prediction obs_pred (initialized from t=0)
+            if self._wm_vis_mode() == "closed_loop":
+                if obs_pred is None:
+                    obs_pred = obs_true_b
+                obs_in = obs_pred
+            else:
+                obs_in = obs_true_b
+
+            with torch.no_grad():
+                next_obs_pred_b, rew_pred_b, done_logit_b = self._predict_next(
+                    group, obs_in, act_true_b
+                )
+
+            r_true = (
+                float(rew_true.to(torch.float32).mean().detach().cpu().item())
+                if rew_true is not None
+                else 0.0
+            )
+            r_pred = float(rew_pred_b.to(torch.float32).mean().detach().cpu().item())
+            reward_true_hist.append(r_true)
+            reward_pred_hist.append(r_pred)
+
+            obs_rmse = float(
+                torch.sqrt(torch.mean((next_obs_pred_b - next_obs_true_b) ** 2))
+                .detach()
+                .cpu()
+                .item()
+            )
+            done_prob = float(torch.sigmoid(done_logit_b).mean().detach().cpu().item())
+
+            xy_true = self._wm_vis_extract_xy(obs_true_b[0])
+            xy_true_next = self._wm_vis_extract_xy(next_obs_true_b[0])
+            # Pred panel uses the simulator start state too (so arrows start at same position),
+            # unless closed-loop mode is enabled.
+            xy_pred = self._wm_vis_extract_xy(obs_in[0])
+            xy_pred_next = self._wm_vis_extract_xy(next_obs_pred_b[0])
+
+            fig = plt.Figure(figsize=(9.5, 6.0), dpi=120)
+            canvas = FigureCanvas(fig)
+            gs = fig.add_gridspec(2, 2, height_ratios=[2.2, 1.0])
+            ax_true = fig.add_subplot(gs[0, 0])
+            ax_pred = fig.add_subplot(gs[0, 1])
+            ax_rew = fig.add_subplot(gs[1, :])
+
+            ax_true.set_title("Simulator (ground truth): state change")
+            ax_true.scatter(
+                xy_true[:, 0].detach().cpu(),
+                xy_true[:, 1].detach().cpu(),
+                s=40,
+                label="obs_t",
+            )
+            ax_true.scatter(
+                xy_true_next[:, 0].detach().cpu(),
+                xy_true_next[:, 1].detach().cpu(),
+                s=40,
+                marker="x",
+                label="obs_{t+1}",
+            )
+            for i in range(xy_true.shape[0]):
+                ax_true.plot(
+                    [
+                        float(xy_true[i, 0].detach().cpu()),
+                        float(xy_true_next[i, 0].detach().cpu()),
+                    ],
+                    [
+                        float(xy_true[i, 1].detach().cpu()),
+                        float(xy_true_next[i, 1].detach().cpu()),
+                    ],
+                    linewidth=1.0,
+                    alpha=0.8,
+                )
+            if xlim is not None:
+                ax_true.set_xlim(*xlim)
+            if ylim is not None:
+                ax_true.set_ylim(*ylim)
+            ax_true.set_aspect("equal", adjustable="box")
+            ax_true.grid(True, alpha=0.25)
+            ax_true.legend(loc="upper right", fontsize=8)
+
+            ax_pred.set_title("World model: predicted state change")
+            ax_pred.scatter(
+                xy_pred[:, 0].detach().cpu(),
+                xy_pred[:, 1].detach().cpu(),
+                s=40,
+                label="obs_t",
+            )
+            ax_pred.scatter(
+                xy_pred_next[:, 0].detach().cpu(),
+                xy_pred_next[:, 1].detach().cpu(),
+                s=40,
+                marker="x",
+                label="obs_{t+1} (pred)",
+            )
+            for i in range(xy_pred.shape[0]):
+                ax_pred.plot(
+                    [
+                        float(xy_pred[i, 0].detach().cpu()),
+                        float(xy_pred_next[i, 0].detach().cpu()),
+                    ],
+                    [
+                        float(xy_pred[i, 1].detach().cpu()),
+                        float(xy_pred_next[i, 1].detach().cpu()),
+                    ],
+                    linewidth=1.0,
+                    alpha=0.8,
+                )
+            if xlim is not None:
+                ax_pred.set_xlim(*xlim)
+            if ylim is not None:
+                ax_pred.set_ylim(*ylim)
+            ax_pred.set_aspect("equal", adjustable="box")
+            ax_pred.grid(True, alpha=0.25)
+            ax_pred.legend(loc="upper right", fontsize=8)
+
+            ax_rew.set_title("Reward (mean over agents): predicted vs ground truth")
+            xs = np.arange(len(reward_true_hist))
+            ax_rew.plot(xs, reward_true_hist, label="true", linewidth=2.0)
+            ax_rew.plot(xs, reward_pred_hist, label="pred", linewidth=2.0)
+            ax_rew.axvline(len(reward_true_hist) - 1, color="k", alpha=0.2)
+            ax_rew.grid(True, alpha=0.25)
+            ax_rew.legend(loc="upper right", fontsize=9)
+            ax_rew.set_xlabel("t")
+
+            fig.suptitle(
+                f"MBPO world-model debug ({self._wm_vis_mode()}) | group={group} | t={t} | obs_rmse={obs_rmse:.4f} | "
+                f"r_true={r_true:.4f} r_pred={r_pred:.4f} | done_prob~{done_prob:.2f}",
+                fontsize=11,
+            )
+
+            canvas.draw()
+            rgba = np.asarray(canvas.buffer_rgba())
+            frames.append(rgba[..., :3].copy().astype(np.uint8))
+
+            # Advance closed-loop state only if enabled.
+            if self._wm_vis_mode() == "closed_loop":
+                obs_pred = next_obs_pred_b.detach()
+
+        return frames
+
+    def _wm_vis_log_video(self, *, group: str, frames: List) -> None:
+        if not frames:
+            return
+        try:
+            import numpy as np
+        except Exception:
+            return
+
+        video_frames = np.stack(frames, axis=0)  # [T,H,W,3]
+        vid = torch.tensor(
+            np.transpose(video_frames, (0, 3, 1, 2)), dtype=torch.uint8
+        ).unsqueeze(0)
+
+        step = getattr(self.experiment, "total_frames", None)
+        if step is None:
+            step = int(getattr(self, "_train_steps", {}).get(group, 0))
+
+        for logger in getattr(self.experiment.logger, "loggers", []):
+            if WandbLogger is not None and isinstance(logger, WandbLogger):
+                logger.log_video(
+                    f"world_model/{group}/debug_video",
+                    vid,
+                    fps=self._wm_vis_fps(),
+                    commit=False,
+                )
+            else:
+                # Other loggers cannot deal with odd video sizes; mirror Logger.log_evaluation behavior.
+                for index in (-1, -2):
+                    if vid.shape[index] % 2 != 0:
+                        vid = vid.index_select(index, torch.arange(1, vid.shape[index]))
+                logger.log_video(f"world_model_{group}_debug_video", vid, step=step)
+
+    def _maybe_log_world_model_debug_video(
+        self, *, group: str, batch: TensorDictBase
+    ) -> None:
+        if not self._wm_vis_should_log(group):
+            return
+        if batch is None or batch.numel() == 0:
+            return
+
+        traj = None
+        try:
+            if not hasattr(batch, "batch_size") or len(batch.batch_size) == 0:
+                return
+
+            # We want a *time-contiguous* trajectory from a *single* env index.
+            # Collector output is typically 2D, but the order can be [T,B] or [B,T].
+            if len(batch.batch_size) >= 2:
+                env_i = self._wm_vis_env_index()
+
+                # Use collector/traj_ids (if available) to infer which axis is time:
+                # the time axis should have *few* switches in traj_id for a fixed env.
+                time_axis = 0  # default assume [T,B]
+                try:
+                    traj_ids = batch.get(("collector", "traj_ids"), None)
+                except Exception:
+                    traj_ids = None
+
+                if traj_ids is not None and hasattr(traj_ids, "ndim") and int(traj_ids.ndim) == 2:
+                    # Candidate 1: axis0 is time => seq = traj_ids[:, env]
+                    env0 = min(env_i, int(traj_ids.shape[1]) - 1)
+                    seq0 = traj_ids[:, env0]
+                    # Candidate 2: axis1 is time => seq = traj_ids[env, :]
+                    env1 = min(env_i, int(traj_ids.shape[0]) - 1)
+                    seq1 = traj_ids[env1, :]
+                    try:
+                        sw0 = float((seq0[1:] != seq0[:-1]).float().mean().detach().cpu().item())
+                    except Exception:
+                        sw0 = 1.0
+                    try:
+                        sw1 = float((seq1[1:] != seq1[:-1]).float().mean().detach().cpu().item())
+                    except Exception:
+                        sw1 = 1.0
+                    time_axis = 0 if sw0 <= sw1 else 1
+
+                # Extract env trajectory along inferred time axis.
+                if time_axis == 0:
+                    env_i = min(env_i, int(batch.batch_size[1]) - 1)
+                    traj = batch[:, env_i]
+                else:
+                    env_i = min(env_i, int(batch.batch_size[0]) - 1)
+                    traj = batch[env_i, :]
+
+                # Cut to a single contiguous "episode segment" using traj_ids if possible.
+                # This avoids videos that look like random frames due to env resets within the batch.
+                try:
+                    ids = traj.get(("collector", "traj_ids"), None)
+                except Exception:
+                    ids = None
+                if ids is not None:
+                    ids = ids.detach()
+                    if hasattr(ids, "ndim") and int(ids.ndim) >= 1:
+                        ids_1d = ids.reshape(-1)
+                        if ids_1d.numel() >= 2:
+                            change = (ids_1d[1:] != ids_1d[:-1]).nonzero(as_tuple=True)[0] + 1
+                            starts = torch.cat(
+                                [torch.zeros(1, device=change.device, dtype=change.dtype), change],
+                                dim=0,
+                            )
+                            ends = torch.cat(
+                                [change, torch.tensor([ids_1d.numel()], device=change.device, dtype=change.dtype)],
+                                dim=0,
+                            )
+                            # Pick the longest segment (more likely to be a coherent episode chunk).
+                            lens = (ends - starts).to(torch.long)
+                            seg_idx = int(torch.argmax(lens).detach().cpu().item())
+                            seg_start = int(starts[seg_idx].detach().cpu().item())
+                            seg_end = int(ends[seg_idx].detach().cpu().item())
+                            if seg_end - seg_start >= 2:
+                                traj = traj[seg_start:seg_end]
+
+                # Also cut at the first done within the selected segment to mimic a single episode.
+                try:
+                    d = traj.get(("next", "done"), None)
+                except Exception:
+                    d = None
+                if d is None:
+                    try:
+                        d = traj.get(("next", group, "done"), None)
+                        if d is not None and d.dim() >= 2:
+                            # Reduce agent dim.
+                            d = d.any(-2)
+                    except Exception:
+                        d = None
+                if d is not None:
+                    d1 = d.reshape(-1).to(torch.bool)
+                    done_idx = d1.nonzero(as_tuple=True)[0]
+                    if done_idx.numel() > 0:
+                        stop = int(done_idx[0].detach().cpu().item()) + 1
+                        if stop >= 2:
+                            traj = traj[:stop]
+
+            # Fallback: treat single-dim batch as time-indexable.
+            elif len(batch.batch_size) == 1:
+                if int(batch.batch_size[0]) > 1:
+                    traj = batch
+        except Exception:
+            traj = None
+
+        if traj is None:
+            return
+        # Need at least 2 steps to visualize a state change.
+        if not hasattr(traj, "batch_size") or int(traj.batch_size[0]) < 2:
+            return
+
+        # IMPORTANT: video generation must not change training results.
+        # Rendering calls into the world model (e.g., ensemble member selection via torch.randint),
+        # which consumes torch RNG. If we let that touch the global RNG stream, it will change
+        # synthetic rollout randomness / sampling order and produce different policies.
+        #
+        # We therefore fork RNG state (CPU + CUDA) so any RNG consumption here is rolled back.
+        devices: List[int] = []
+        try:
+            dev = torch.device(self.device)
+            if dev.type == "cuda":
+                devices = [int(dev.index or 0)]
+        except Exception:
+            devices = []
+
+        with torch.random.fork_rng(devices=devices, enabled=True):
+            # Optional: seed the visualization RNG for stable videos across runs.
+            try:
+                base_seed = int(getattr(self.experiment, "seed", 0))
+                step = int(getattr(self, "_train_steps", {}).get(group, 0))
+                torch.manual_seed(base_seed + 99_999 + step)
+                if devices:
+                    torch.cuda.manual_seed_all(base_seed + 99_999 + step)
+            except Exception:
+                pass
+
+            frames = self._wm_vis_render_frames(
+                group=group, traj=traj, horizon=self._wm_vis_horizon()
+            )
+        if frames is None:
+            return
+        self._wm_vis_log_video(group=group, frames=frames)
 
     def get_replay_buffer(
         self, group: str, transforms: List = None
@@ -408,6 +901,11 @@ class _MbpoWorldModelMixin:
         model_lr: float,
         model_hidden_size: int,
         model_num_layers: int,
+        reward_loss_coef: float = 1.0,
+        reward_normalize: bool = False,
+        reward_norm_alpha: float = 0.01,
+        reward_norm_eps: float = 1e-6,
+        separate_reward_net: bool = False,
         training_iterations: int = 0,
         centralized_dynamics: bool = False,
         stochastic_dynamics: bool = True,
@@ -419,6 +917,13 @@ class _MbpoWorldModelMixin:
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
         save_world_model_interval: Optional[int] = None,
+        world_model_debug_video: bool = False,
+        world_model_debug_video_interval: int = 200,
+        world_model_debug_video_horizon: int = 50,
+        world_model_debug_video_fps: int = 20,
+        world_model_debug_video_env_index: int = 0,
+        world_model_debug_video_obs_xy_indices: Optional[List[int]] = None,
+        world_model_debug_video_mode: str = "open_loop",
     ) -> None:
         self.rollout_horizon = rollout_horizon
         self.model_train_freq = model_train_freq
@@ -429,6 +934,11 @@ class _MbpoWorldModelMixin:
         self.model_lr = model_lr
         self.model_hidden_size = model_hidden_size
         self.model_num_layers = model_num_layers
+        self.reward_loss_coef = float(reward_loss_coef)
+        self.reward_normalize = bool(reward_normalize)
+        self.reward_norm_alpha = float(reward_norm_alpha)
+        self.reward_norm_eps = float(reward_norm_eps)
+        self.separate_reward_net = bool(separate_reward_net)
         self.training_iterations = max(0, int(training_iterations))
         self.centralized_dynamics = centralized_dynamics
         self.stochastic_dynamics = stochastic_dynamics
@@ -438,12 +948,22 @@ class _MbpoWorldModelMixin:
         self.warmup_steps = warmup_steps
         self.save_world_model_path = save_world_model_path
         self.save_world_model_interval = save_world_model_interval
+        self.world_model_debug_video = bool(world_model_debug_video)
+        self.world_model_debug_video_interval = int(world_model_debug_video_interval)
+        self.world_model_debug_video_horizon = int(world_model_debug_video_horizon)
+        self.world_model_debug_video_fps = int(world_model_debug_video_fps)
+        self.world_model_debug_video_env_index = int(world_model_debug_video_env_index)
+        self.world_model_debug_video_obs_xy_indices = world_model_debug_video_obs_xy_indices
+        self.world_model_debug_video_mode = str(world_model_debug_video_mode)
         self._dynamics: Dict[str, List[_DynamicsModel]] = {}
         self._dyn_optimizers: Dict[str, List[torch.optim.Optimizer]] = {}
         self._model_losses: Dict[str, torch.Tensor] = {}
         self._train_steps: Dict[str, int] = {}
         self._elite_indices: Dict[str, torch.Tensor] = {}
         self._dynamics_train_buffers: Dict[str, _DynamicsTrainBuffer] = {}
+        # Running reward normalization stats (per group). Stored on device.
+        self._reward_running_mean: Dict[str, torch.Tensor] = {}
+        self._reward_running_var: Dict[str, torch.Tensor] = {}
 
         for group in self.group_map.keys():
             obs_shape = self.observation_spec[group, "observation"].shape
@@ -484,6 +1004,7 @@ class _MbpoWorldModelMixin:
                     stochastic=self.stochastic_dynamics,
                     min_log_var=self.min_log_var,
                     max_log_var=self.max_log_var,
+                    separate_reward_net=getattr(self, "separate_reward_net", False),
                 ).to(self.device)
                 models.append(model)
                 opts.append(torch.optim.Adam(model.parameters(), lr=self.model_lr))
@@ -507,6 +1028,10 @@ class _MbpoWorldModelMixin:
             self._dynamics_train_buffers[group] = self._get_dynamics_training_buffer(
                 memory_size=dyn_mem
             )
+
+            # Initialize running reward stats (scalar) for optional normalization.
+            self._reward_running_mean[group] = torch.zeros((), device=self.device)
+            self._reward_running_var[group] = torch.ones((), device=self.device)
         
         # Load pretrained world model if path is provided
         if load_world_model_path is not None:
@@ -556,6 +1081,14 @@ class _MbpoWorldModelMixin:
                 else:
                     dyn_batch = flat_batch
                 self._train_dynamics(group, dyn_batch)
+
+            # Optional debug video: compare predicted vs simulator transitions (and rewards) on a real rollout.
+            # This logs a video where each frame includes both the state-change comparison and reward plot.
+            try:
+                self._maybe_log_world_model_debug_video(group=group, batch=batch)
+            except Exception:
+                pass
+
             if self._train_steps[group] > self.warmup_steps:
                 synthetic = self._generate_model_rollouts(group, flat_batch)
                 if synthetic is not None and synthetic.numel() > 0:
@@ -647,6 +1180,19 @@ class _MbpoWorldModelMixin:
             reward_flat = reward.flatten(0, 1)
             done_flat = done.flatten(0, 1)
 
+        # Optional: update running reward mean/var on the full (non-bootstrapped) batch.
+        # This is used to scale the reward loss so small-magnitude rewards don't get ignored.
+        if getattr(self, "reward_normalize", False):
+            with torch.no_grad():
+                r_all = reward_flat.detach().to(torch.float32).flatten()
+                if r_all.numel() > 0:
+                    batch_mean = r_all.mean()
+                    batch_var = r_all.var(unbiased=False)
+                    alpha = float(getattr(self, "reward_norm_alpha", 0.01))
+                    alpha = min(max(alpha, 0.0), 1.0)
+                    self._reward_running_mean[group].lerp_(batch_mean, alpha)
+                    self._reward_running_var[group].lerp_(batch_var, alpha)
+
         # Bootstrap sampling per model encourages ensemble diversity.
         n_samples = obs_flat.shape[0]
 
@@ -684,7 +1230,26 @@ class _MbpoWorldModelMixin:
             inv_var_obs = torch.exp(-lv_delta)
             inv_var_rew = torch.exp(-lv_rew)
             loss_obs = torch.mean((mu_next - no) ** 2 * inv_var_obs + lv_delta)
-            loss_rew = torch.mean((mu_rew - r) ** 2 * inv_var_rew + lv_rew)
+
+            # Reward loss scaling / normalization:
+            # When rewards have small magnitude, unweighted MSE/NLL often collapses toward ~0.
+            # If enabled, we compute the reward loss in *normalized* space using running mean/std.
+            # This uses both running mean and variance, making gradients invariant to reward offset/scale.
+            if getattr(self, "reward_normalize", False):
+                eps = float(getattr(self, "reward_norm_eps", 1e-6))
+                r_mean = self._reward_running_mean[group]
+                r_std = torch.sqrt(self._reward_running_var[group].clamp_min(0.0)) + eps
+                # Normalize targets and predictions.
+                r_n = (r - r_mean) / r_std
+                mu_rew_n = (mu_rew - r_mean) / r_std
+                # If stochastic (log-variance provided), convert to normalized-space log-variance:
+                # var_n = var / std^2  => log_var_n = log_var - 2*log(std)
+                lv_rew_n = lv_rew - 2.0 * torch.log(r_std)
+                inv_var_rew_n = torch.exp(-lv_rew_n)
+                loss_rew = torch.mean((mu_rew_n - r_n) ** 2 * inv_var_rew_n + lv_rew_n)
+            else:
+                loss_rew = torch.mean((mu_rew - r) ** 2 * inv_var_rew + lv_rew)
+            loss_rew = loss_rew * float(getattr(self, "reward_loss_coef", 1.0))
             loss_done = F.binary_cross_entropy_with_logits(done_logit, d.float())
             loss = loss_obs + loss_rew + loss_done
             loss.backward()
@@ -781,6 +1346,52 @@ class _MbpoWorldModelMixin:
             abs_error = torch.abs(mean_pred_flat - reward_flat_for_bias)
             mean_abs_error = abs_error.mean().detach().item()
             
+            # Percentage error (MAPE) per sample: |pred - actual| / |actual| * 100
+            # Note: MAPE can exceed 100% (e.g., when |error| > |actual|) and is unstable near 0.
+            denom = reward_flat_for_bias.abs()
+            nonzero_mask = denom > 1e-6
+            mape_mask_rate = 1.0 - float(nonzero_mask.float().mean().detach().cpu().item())
+            if nonzero_mask.any():
+                percentage_error = (abs_error[nonzero_mask] / denom[nonzero_mask]) * 100.0
+                mean_percentage_error = percentage_error.mean().detach().item()
+            else:
+                mean_percentage_error = 0.0
+
+            # Epsilon-stabilized "relative error %" (includes all samples, but still can be large).
+            # Useful when rewards can be ~0 frequently.
+            rel_eps = 1e-3
+            mean_percentage_error_eps = (
+                (abs_error / (denom + rel_eps)) * 100.0
+            ).mean().detach().item()
+
+            # Symmetric MAPE (sMAPE): 200 * |pred-actual| / (|pred| + |actual| + eps), bounded in [0, 200].
+            smape_eps = 1e-6
+            smape = (
+                200.0
+                * abs_error
+                / (mean_pred_flat.abs() + reward_flat_for_bias.abs() + smape_eps)
+            )
+            mean_smape = smape.mean().detach().item()
+
+            # Normalized MAE (%): mean(|error|) / (mean(|actual|) + eps) * 100 (much more stable than per-sample MAPE).
+            nmae_eps = 1e-6
+            mean_nmae_percent = (
+                abs_error.mean() / (reward_flat_for_bias.abs().mean() + nmae_eps) * 100.0
+            ).detach().item()
+
+            # Expose current running reward mean/std when normalization is enabled (helps debugging).
+            if getattr(self, "reward_normalize", False):
+                running_reward_mean = float(self._reward_running_mean[group].detach().cpu().item())
+                running_reward_std = float(
+                    torch.sqrt(self._reward_running_var[group].clamp_min(0.0))
+                    .detach()
+                    .cpu()
+                    .item()
+                )
+            else:
+                running_reward_mean = 0.0
+                running_reward_std = 0.0
+            
             # Compute range metrics: mean ± std (averaged across samples)
             pred_reward_min = (mean_pred_flat - std_pred_flat).mean().detach().item()
             pred_reward_max = (mean_pred_flat + std_pred_flat).mean().detach().item()
@@ -873,6 +1484,15 @@ class _MbpoWorldModelMixin:
                 f"world_model/{group}/bias/reward_std_predicted": std_pred_reward,
                 f"world_model/{group}/bias/reward_std_actual": std_actual_reward,
                 f"world_model/{group}/bias/reward_mean_abs_error": mean_abs_error,
+                f"world_model/{group}/percentage_error/reward": mean_percentage_error,
+                f"world_model/{group}/percentage_error/reward_mask_rate": mape_mask_rate,
+                f"world_model/{group}/percentage_error/reward_eps": mean_percentage_error_eps,
+                f"world_model/{group}/percentage_error/reward_smape": mean_smape,
+                f"world_model/{group}/percentage_error/reward_nmae": mean_nmae_percent,
+                f"world_model/{group}/reward_normalize/enabled": float(getattr(self, "reward_normalize", False)),
+                f"world_model/{group}/reward_normalize/running_mean": running_reward_mean,
+                f"world_model/{group}/reward_normalize/running_std": running_reward_std,
+                f"world_model/{group}/reward_normalize/reward_loss_coef": float(getattr(self, "reward_loss_coef", 1.0)),
                 f"world_model/{group}/bias/reward_range_min": pred_reward_min,
                 f"world_model/{group}/bias/reward_range_max": pred_reward_max,
                 # Reward optimism diagnostics
@@ -1164,6 +1784,11 @@ class _MbpoWorldModelMixin:
                 "model_lr": self.model_lr,
                 "model_hidden_size": self.model_hidden_size,
                 "model_num_layers": self.model_num_layers,
+                "reward_loss_coef": float(getattr(self, "reward_loss_coef", 1.0)),
+                "reward_normalize": bool(getattr(self, "reward_normalize", False)),
+                "reward_norm_alpha": float(getattr(self, "reward_norm_alpha", 0.01)),
+                "reward_norm_eps": float(getattr(self, "reward_norm_eps", 1e-6)),
+                "separate_reward_net": bool(getattr(self, "separate_reward_net", False)),
                 "centralized_dynamics": self.centralized_dynamics,
                 "stochastic_dynamics": self.stochastic_dynamics,
                 "n_elites": self.n_elites,
@@ -1203,6 +1828,11 @@ class _MbpoWorldModelMixin:
                 "model_lr": self.model_lr,
                 "model_hidden_size": self.model_hidden_size,
                 "model_num_layers": self.model_num_layers,
+                "reward_loss_coef": float(getattr(self, "reward_loss_coef", 1.0)),
+                "reward_normalize": bool(getattr(self, "reward_normalize", False)),
+                "reward_norm_alpha": float(getattr(self, "reward_norm_alpha", 0.01)),
+                "reward_norm_eps": float(getattr(self, "reward_norm_eps", 1e-6)),
+                "separate_reward_net": bool(getattr(self, "separate_reward_net", False)),
                 "centralized_dynamics": self.centralized_dynamics,
                 "stochastic_dynamics": self.stochastic_dynamics,
                 "n_elites": self.n_elites,
@@ -1284,6 +1914,11 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         model_lr: float,
         model_hidden_size: int,
         model_num_layers: int,
+        reward_loss_coef: float = 1.0,
+        reward_normalize: bool = False,
+        reward_norm_alpha: float = 0.01,
+        reward_norm_eps: float = 1e-6,
+        separate_reward_net: bool = False,
         training_iterations: int = 0,
         centralized_dynamics: bool = False,
         stochastic_dynamics: bool = True,
@@ -1295,6 +1930,13 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
         save_world_model_interval: Optional[int] = None,
+        world_model_debug_video: bool = False,
+        world_model_debug_video_interval: int = 200,
+        world_model_debug_video_horizon: int = 50,
+        world_model_debug_video_fps: int = 20,
+        world_model_debug_video_env_index: int = 0,
+        world_model_debug_video_obs_xy_indices: Optional[List[int]] = None,
+        world_model_debug_video_mode: str = "open_loop",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1308,6 +1950,11 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
             model_lr=model_lr,
             model_hidden_size=model_hidden_size,
             model_num_layers=model_num_layers,
+            reward_loss_coef=reward_loss_coef,
+            reward_normalize=reward_normalize,
+            reward_norm_alpha=reward_norm_alpha,
+            reward_norm_eps=reward_norm_eps,
+            separate_reward_net=separate_reward_net,
             training_iterations=training_iterations,
             centralized_dynamics=centralized_dynamics,
             stochastic_dynamics=stochastic_dynamics,
@@ -1319,6 +1966,13 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
             load_world_model_strict=load_world_model_strict,
             save_world_model_path=save_world_model_path,
             save_world_model_interval=save_world_model_interval,
+            world_model_debug_video=world_model_debug_video,
+            world_model_debug_video_interval=world_model_debug_video_interval,
+            world_model_debug_video_horizon=world_model_debug_video_horizon,
+            world_model_debug_video_fps=world_model_debug_video_fps,
+            world_model_debug_video_env_index=world_model_debug_video_env_index,
+            world_model_debug_video_obs_xy_indices=world_model_debug_video_obs_xy_indices,
+            world_model_debug_video_mode=world_model_debug_video_mode,
         )
 
     #############################
@@ -1357,6 +2011,11 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
         model_lr: float,
         model_hidden_size: int,
         model_num_layers: int,
+        reward_loss_coef: float = 1.0,
+        reward_normalize: bool = False,
+        reward_norm_alpha: float = 0.01,
+        reward_norm_eps: float = 1e-6,
+        separate_reward_net: bool = False,
         training_iterations: int = 0,
         centralized_dynamics: bool = False,
         stochastic_dynamics: bool = True,
@@ -1368,6 +2027,13 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
         save_world_model_interval: Optional[int] = None,
+        world_model_debug_video: bool = False,
+        world_model_debug_video_interval: int = 200,
+        world_model_debug_video_horizon: int = 50,
+        world_model_debug_video_fps: int = 20,
+        world_model_debug_video_env_index: int = 0,
+        world_model_debug_video_obs_xy_indices: Optional[List[int]] = None,
+        world_model_debug_video_mode: str = "open_loop",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1381,6 +2047,11 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
             model_lr=model_lr,
             model_hidden_size=model_hidden_size,
             model_num_layers=model_num_layers,
+            reward_loss_coef=reward_loss_coef,
+            reward_normalize=reward_normalize,
+            reward_norm_alpha=reward_norm_alpha,
+            reward_norm_eps=reward_norm_eps,
+            separate_reward_net=separate_reward_net,
             training_iterations=training_iterations,
             centralized_dynamics=centralized_dynamics,
             stochastic_dynamics=stochastic_dynamics,
@@ -1392,6 +2063,13 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
             load_world_model_strict=load_world_model_strict,
             save_world_model_path=save_world_model_path,
             save_world_model_interval=save_world_model_interval,
+            world_model_debug_video=world_model_debug_video,
+            world_model_debug_video_interval=world_model_debug_video_interval,
+            world_model_debug_video_horizon=world_model_debug_video_horizon,
+            world_model_debug_video_fps=world_model_debug_video_fps,
+            world_model_debug_video_env_index=world_model_debug_video_env_index,
+            world_model_debug_video_obs_xy_indices=world_model_debug_video_obs_xy_indices,
+            world_model_debug_video_mode=world_model_debug_video_mode,
         )
 
 
@@ -1412,6 +2090,11 @@ class MbpoConfig(MasacConfig):
     model_lr: float = MISSING
     model_hidden_size: int = MISSING
     model_num_layers: int = MISSING
+    reward_loss_coef: float = 1.0
+    reward_normalize: bool = False
+    reward_norm_alpha: float = 0.01
+    reward_norm_eps: float = 1e-6
+    separate_reward_net: bool = False
     training_iterations: int = 0
     centralized_dynamics: bool = False
     stochastic_dynamics: bool = True
@@ -1423,6 +2106,17 @@ class MbpoConfig(MasacConfig):
     load_world_model_strict: bool = True
     save_world_model_path: Optional[str] = None
     save_world_model_interval: Optional[int] = None
+    # Debug visualization: log a video comparing world-model predictions vs simulator transitions.
+    world_model_debug_video: bool = False
+    world_model_debug_video_interval: int = 200
+    world_model_debug_video_horizon: int = 50
+    world_model_debug_video_fps: int = 20
+    world_model_debug_video_env_index: int = 0
+    # Indices of obs dims to interpret as (x,y) for plotting; if None, uses the first two dims.
+    world_model_debug_video_obs_xy_indices: Optional[List[int]] = None
+    # 'open_loop' compares 1-step predictions from the simulator state (same start state each frame).
+    # 'closed_loop' rolls out the world model by feeding its own predicted state back in.
+    world_model_debug_video_mode: str = "open_loop"
 
     @staticmethod
     def associated_class() -> Type[Masac]:
@@ -1458,6 +2152,11 @@ class MbpoMappoConfig(MappoConfig):
     model_lr: float = MISSING
     model_hidden_size: int = MISSING
     model_num_layers: int = MISSING
+    reward_loss_coef: float = 1.0
+    reward_normalize: bool = False
+    reward_norm_alpha: float = 0.01
+    reward_norm_eps: float = 1e-6
+    separate_reward_net: bool = False
     training_iterations: int = 0
     centralized_dynamics: bool = False
     stochastic_dynamics: bool = True
@@ -1469,6 +2168,13 @@ class MbpoMappoConfig(MappoConfig):
     load_world_model_strict: bool = True
     save_world_model_path: Optional[str] = None
     save_world_model_interval: Optional[int] = None
+    world_model_debug_video: bool = False
+    world_model_debug_video_interval: int = 200
+    world_model_debug_video_horizon: int = 50
+    world_model_debug_video_fps: int = 20
+    world_model_debug_video_env_index: int = 0
+    world_model_debug_video_obs_xy_indices: Optional[List[int]] = None
+    world_model_debug_video_mode: str = "open_loop"
 
     @staticmethod
     def associated_class() -> Type[Mappo]:

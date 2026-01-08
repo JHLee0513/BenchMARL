@@ -32,7 +32,11 @@ class _HydraMissingMetadataError(FileNotFoundError):
 
 
 def load_experiment_from_hydra(
-    cfg: DictConfig, task_name: str, callbacks=()
+    cfg: DictConfig,
+    task_name: str,
+    callbacks=(),
+    *,
+    algorithm_name: str | None = None,
 ) -> Experiment:
     """Creates an :class:`~benchmarl.experiment.Experiment` from hydra config.
 
@@ -44,7 +48,9 @@ def load_experiment_from_hydra(
         :class:`~benchmarl.experiment.Experiment`
 
     """
-    algorithm_config = load_algorithm_config_from_hydra(cfg.algorithm)
+    algorithm_config = load_algorithm_config_from_hydra(
+        cfg.algorithm, algorithm_name=algorithm_name
+    )
     experiment_config = load_experiment_config_from_hydra(cfg.experiment)
     task_config = load_task_config_from_hydra(cfg.task, task_name)
     model_config = load_model_config_from_hydra(cfg.model)
@@ -95,7 +101,9 @@ def load_experiment_config_from_hydra(cfg: DictConfig) -> ExperimentConfig:
     return OmegaConf.to_object(cfg)
 
 
-def load_algorithm_config_from_hydra(cfg: DictConfig) -> AlgorithmConfig:
+def load_algorithm_config_from_hydra(
+    cfg: DictConfig, *, algorithm_name: str | None = None
+) -> AlgorithmConfig:
     """Returns a :class:`~benchmarl.algorithms.AlgorithmConfig` from hydra config.
 
     Args:
@@ -108,17 +116,20 @@ def load_algorithm_config_from_hydra(cfg: DictConfig) -> AlgorithmConfig:
     # Convert to dict first
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     
-    # Try to determine the algorithm class from the config
-    # First, check if we can get it from the algorithm name in hydra runtime
-    algorithm_name = None
-    if _has_hydra:
+    # Determine algorithm name.
+    # IMPORTANT: Avoid heuristic matching. Adding extra keys (e.g. MBPO-only
+    # `load_world_model_path`) can otherwise change which AlgorithmConfig class is picked,
+    # breaking reproducibility and even changing the algorithm implementation.
+    if algorithm_name is None and _has_hydra:
         try:
             from hydra.core.hydra_config import HydraConfig
-            hydra_cfg = HydraConfig.get()
-            if hydra_cfg is not None and hasattr(hydra_cfg.runtime, 'choices'):
-                algorithm_name = hydra_cfg.runtime.choices.get("algorithm")
+
+            if HydraConfig.initialized():
+                hydra_cfg = HydraConfig.get()
+                if hydra_cfg is not None and hasattr(hydra_cfg.runtime, "choices"):
+                    algorithm_name = hydra_cfg.runtime.choices.get("algorithm")
         except Exception:
-            pass
+            algorithm_name = None
     
     # Get the algorithm config class
     if algorithm_name is not None and algorithm_name in algorithm_config_registry:
@@ -130,42 +141,15 @@ def load_algorithm_config_from_hydra(cfg: DictConfig) -> AlgorithmConfig:
         # Instantiate the config class with filtered fields
         return config_class(**filtered_cfg)
     else:
-        # Fallback: try to find a matching config class by checking which one
-        # accepts all the keys in the config (heuristic approach)
         cfg_dict_keys = set(cfg_dict.keys())
-        best_match = None
-        best_match_score = 0
-        
-        for algo_name, config_class in algorithm_config_registry.items():
-            valid_fields = {f.name for f in fields(config_class)}
-            # Count how many keys match
-            matching_keys = cfg_dict_keys.intersection(valid_fields)
-            # Prefer configs where all keys are valid (perfect match)
-            if cfg_dict_keys.issubset(valid_fields):
-                best_match = (algo_name, config_class)
-                break
-            # Otherwise, prefer configs with the most matching keys
-            elif len(matching_keys) > best_match_score:
-                best_match_score = len(matching_keys)
-                best_match = (algo_name, config_class)
-        
-        if best_match is not None:
-            algo_name, config_class = best_match
-            valid_fields = {f.name for f in fields(config_class)}
-            # Filter config to only include valid fields
-            filtered_cfg = {k: v for k, v in cfg_dict.items() if k in valid_fields}
-            return config_class(**filtered_cfg)
-        else:
-            # Last resort: try to convert directly (may fail if extra fields present)
-            try:
-                return OmegaConf.to_object(cfg)
-            except TypeError as e:
-                # If that fails, provide a helpful error message
-                raise ValueError(
-                    f"Could not determine algorithm config class from config keys: {list(cfg_dict_keys)}. "
-                    f"Available algorithms: {list(algorithm_config_registry.keys())}. "
-                    f"Original error: {e}"
-                )
+        raise ValueError(
+            "Could not determine algorithm config class because `algorithm_name` is missing or unknown.\n"
+            f"- algorithm_name: {algorithm_name}\n"
+            f"- cfg keys: {sorted(cfg_dict_keys)}\n"
+            f"- available algorithms: {sorted(list(algorithm_config_registry.keys()))}\n"
+            "Fix: call `load_experiment_from_hydra(..., algorithm_name=...)` (recommended) or run via "
+            "`benchmarl/run.py` so Hydra choices are available."
+        )
 
 
 def load_model_config_from_hydra(cfg: DictConfig) -> ModelConfig:
@@ -249,4 +233,4 @@ def reload_experiment_from_file(restore_file: str) -> Experiment:
     print("\nLoaded config:\n")
     print(OmegaConf.to_yaml(cfg))
 
-    return load_experiment_from_hydra(cfg, task_name=task_name)
+    return load_experiment_from_hydra(cfg, task_name=task_name, algorithm_name=algorithm_name)
