@@ -743,11 +743,19 @@ class Experiment(CallbackNotifier):
 
                 training_tds = []
                 for _ in range(self.config.n_optimizer_steps(self.on_policy)):
+                    # Allow algorithms to scale the number of optimizer minibatches (e.g., MBPO synthetic training)
+                    # without changing environment collection / step counters.
+                    try:
+                        mb_mult = int(self.algorithm.train_minibatch_multiplier(group))
+                    except Exception:
+                        mb_mult = 1
+                    mb_mult = max(1, mb_mult)
                     for _ in range(
                         -(
                             -self.config.train_batch_size(self.on_policy)
                             // self.config.train_minibatch_size(self.on_policy)
                         )
+                        * mb_mult
                     ):
                         training_tds.append(self._optimizer_loop(group))
                 training_td = torch.stack(training_tds)

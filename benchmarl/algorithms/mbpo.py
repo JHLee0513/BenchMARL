@@ -50,13 +50,50 @@ class _MixedReplayBuffer:
         real: ReplayBuffer,
         synthetic: ReplayBuffer,
         get_real_ratio: Callable[[], float],
+        get_syn_ratio: Callable[[], Optional[float]],
         on_policy: bool,
     ):
         self._real = real
         self._synthetic = synthetic
         self._get_real_ratio = get_real_ratio
+        self._get_syn_ratio = get_syn_ratio
         self._on_policy = on_policy
         self._last_sample_n_real: Optional[int] = None
+        # When syn_ratio is used, we keep per-sample batch sizes bounded by the baseline
+        # replay buffer batch size, and instead increase the number of optimizer minibatches.
+        # This avoids OOM from returning huge concatenated batches.
+        self._ratio_plan: List[Tuple[float, float]] = [(1.0, 0.0)]  # [(real_units, synth_units)]
+        self._ratio_plan_idx: int = 0
+
+    def _refresh_ratio_plan(self) -> None:
+        """Build a per-call sampling plan from (real_ratio, syn_ratio) in 'unit' semantics.
+
+        Each plan element is (real_units, synth_units) with real_units+synth_units <= 1.0.
+        Over one full cycle of the plan, we will draw approximately:
+          real_ratio * baseline_batch_size real samples, and
+          syn_ratio  * baseline_batch_size synthetic samples.
+        """
+        sr = self._get_syn_ratio()
+        if sr is None:
+            self._ratio_plan = [(1.0, 0.0)]
+            self._ratio_plan_idx = 0
+            return
+
+        r_rem = max(0.0, float(self._get_real_ratio() or 0.0))
+        s_rem = max(0.0, float(sr or 0.0))
+        plan: List[Tuple[float, float]] = []
+        # Greedy packing into capacity-1.0 "minibatch slots": fill real first, then synthetic.
+        while r_rem > 1e-12 or s_rem > 1e-12:
+            r_take = min(1.0, r_rem)
+            r_rem -= r_take
+            cap = 1.0 - r_take
+            s_take = min(cap, s_rem)
+            s_rem -= s_take
+            plan.append((float(r_take), float(s_take)))
+        if not plan:
+            plan = [(1.0, 0.0)]
+        self._ratio_plan = plan
+        self._ratio_plan_idx = 0
 
     @property
     def storage(self):
@@ -92,6 +129,13 @@ class _MixedReplayBuffer:
             self._synthetic.empty()
 
     def extend(self, data: TensorDictBase):
+        # Treat each extend() as a new "iteration" boundary and reset the plan pointer.
+        # Experiment calls extend() exactly once per iteration.
+        try:
+            self._refresh_ratio_plan()
+        except Exception:
+            # Keep previous plan on failure.
+            pass
         return self._real.extend(data)
 
     def update_tensordict_priority(self, data: TensorDictBase):
@@ -105,6 +149,14 @@ class _MixedReplayBuffer:
     def _safe_sample(self, buffer: ReplayBuffer, n: int) -> Optional[TensorDictBase]:
         if n <= 0:
             return None
+        # Clamp to buffer length when available (avoids errors for SamplerWithoutReplacement).
+        try:
+            buf_len = int(len(buffer))
+            if buf_len <= 0:
+                return None
+            n = min(int(n), buf_len)
+        except Exception:
+            pass
         try:
             return buffer.sample(batch_size=n)
         except TypeError:
@@ -124,6 +176,49 @@ class _MixedReplayBuffer:
 
         # Guard against unexpected None.
         total = max(1, int(total))
+
+        # New semantics (optional): if syn_ratio is set, interpret ratios as *multipliers*
+        # of the baseline minibatch size (the replay buffer's configured batch_size).
+        # - n_real  = ceil(total * real_ratio)
+        # - n_synth = ceil(total * syn_ratio)
+        #
+        # Backward compatible: if syn_ratio is None, keep the old "real_ratio is a fraction"
+        # behavior, where synthetic count is derived as (1-real_ratio).
+        sr_raw = self._get_syn_ratio()
+        use_new = sr_raw is not None
+
+        if use_new:
+            # Bounded minibatch: choose (real_units, synth_units) from the plan and sample at most `total`.
+            if not self._ratio_plan:
+                self._refresh_ratio_plan()
+            ru, su = self._ratio_plan[self._ratio_plan_idx % len(self._ratio_plan)]
+            self._ratio_plan_idx += 1
+
+            # Convert units to counts, ensuring we never exceed `total`.
+            ru = max(0.0, float(ru))
+            su = max(0.0, float(su))
+            if ru + su >= 1.0 - 1e-12:
+                # Fill the whole minibatch.
+                n_real = int(math.floor(total * ru))
+                n_real = min(total, max(0, n_real))
+                n_synth = total - n_real
+            else:
+                n_real = int(math.floor(total * ru))
+                n_real = min(total, max(0, n_real))
+                remaining = total - n_real
+                n_synth = min(remaining, int(math.ceil(total * su)))
+
+            self._last_sample_n_real = n_real
+            real_td = self._safe_sample(self._real, n_real) if n_real > 0 else None
+            synth_td = self._safe_sample(self._synthetic, n_synth) if n_synth > 0 else None
+
+            if real_td is None and synth_td is None:
+                return self._safe_sample(self._real, total)
+            if real_td is None:
+                return synth_td
+            if synth_td is None:
+                return real_td
+            return torch.cat([real_td, synth_td], dim=0)
 
         rr = float(self._get_real_ratio() or 1.0)
         rr = min(max(rr, 0.0), 1.0)
@@ -821,11 +916,16 @@ class _MbpoWorldModelMixin:
         # Create a dedicated synthetic buffer with enough capacity for model rollouts.
         # We size it relative to the on-policy real buffer size for this run.
         base_memory_size = self.experiment_config.replay_buffer_memory_size(self.on_policy)
-        rr = float(getattr(self, "real_ratio", 1.0))
-        rr = min(max(rr, 0.0), 1.0)
-        # New semantics: synthetic count per iteration ~= (1-real_ratio) * N_real.
-        synthetic_memory_size = int(math.ceil(base_memory_size * max(0.0, (1.0 - rr))))
-        synthetic_memory_size = max(1, synthetic_memory_size)
+        sr = getattr(self, "syn_ratio", None)
+        if sr is not None:
+            # New semantics: `syn_ratio` is a multiplier of the baseline batch.
+            synthetic_memory_size = int(math.ceil(base_memory_size * max(0.0, float(sr))))
+        else:
+            # Backward-compatible semantics: synthetic count per iteration ~= (1-real_ratio) * N_real.
+            rr = float(getattr(self, "real_ratio", 1.0))
+            rr = min(max(rr, 0.0), 1.0)
+            synthetic_memory_size = int(math.ceil(base_memory_size * max(0.0, (1.0 - rr))))
+        synthetic_memory_size = max(1, int(synthetic_memory_size))
 
         synthetic_buffer = self._get_synthetic_rollout_replay_buffer(
             group=group, memory_size=synthetic_memory_size, transforms=transforms
@@ -840,12 +940,28 @@ class _MbpoWorldModelMixin:
             real=real_buffer,
             synthetic=synthetic_buffer,
             get_real_ratio=lambda: getattr(self, "real_ratio", 1.0),
+            get_syn_ratio=lambda: getattr(self, "syn_ratio", None),
             on_policy=getattr(self, "on_policy", False),
         )
 
     def replay_buffer_memory_size_multiplier(self) -> float:
         # Do NOT inflate the main replay buffer: synthetic rollouts are stored separately.
         return 1.0
+
+    def train_minibatch_multiplier(self, group: str) -> int:
+        """How many optimizer minibatches to run per *base* minibatch.
+
+        This is used to avoid returning over-sized concatenated minibatches when `syn_ratio` is large.
+        Instead, we run more optimizer minibatches of bounded size.
+        """
+        sr = getattr(self, "syn_ratio", None)
+        if sr is None:
+            return 1
+        rr = float(getattr(self, "real_ratio", 1.0) or 0.0)
+        sr = float(sr or 0.0)
+        rr = max(0.0, rr)
+        sr = max(0.0, sr)
+        return max(1, int(math.ceil(rr + sr)))
 
     def _get_dynamics_training_buffer(self, memory_size: int) -> _DynamicsTrainBuffer:
         return _DynamicsTrainBuffer(capacity=memory_size, device=torch.device(self.device))
@@ -893,6 +1009,11 @@ class _MbpoWorldModelMixin:
         self,
         *,
         rollout_horizon: int,
+        # Optional schedule: linearly increase rollout horizon over training.
+        # If any of these are None/0, we fall back to constant `rollout_horizon`.
+        rollout_horizon_min: Optional[int] = None,
+        rollout_horizon_max: Optional[int] = None,
+        rollout_horizon_ramp_steps: int = 0,
         model_train_freq: int,
         ensemble_size: int,
         model_batch_size: int,
@@ -901,6 +1022,9 @@ class _MbpoWorldModelMixin:
         model_lr: float,
         model_hidden_size: int,
         model_num_layers: int,
+        # New semantics: optional multiplier for synthetic samples per minibatch.
+        # If set, it overrides the old "real_ratio fraction" mixing behavior in sampling.
+        syn_ratio: Optional[float] = None,
         reward_loss_coef: float = 1.0,
         reward_normalize: bool = False,
         reward_norm_alpha: float = 0.01,
@@ -917,6 +1041,17 @@ class _MbpoWorldModelMixin:
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
         save_world_model_interval: Optional[int] = None,
+        # Oracle reward from predicted next-state (used for synthetic rollouts).
+        # If enabled, synthetic rewards come from a deterministic function of the *predicted* state
+        # rather than the learned reward head.
+        oracle_reward: bool = False,
+        oracle_reward_mode: str = "goal_distance_from_obs",
+        # For mode=goal_distance_from_obs: indices (len=2) in the per-agent observation vector
+        # that represent the goal-relative position (dx, dy). Reward is -||[dx,dy]||.
+        oracle_reward_goal_rel_indices: Optional[List[int]] = None,
+        oracle_reward_scale: float = 1.0,
+        # If True, do not train the reward head (loss term set to 0) since reward is computed by oracle.
+        oracle_reward_disable_reward_head_loss: bool = True,
         world_model_debug_video: bool = False,
         world_model_debug_video_interval: int = 200,
         world_model_debug_video_horizon: int = 50,
@@ -925,11 +1060,19 @@ class _MbpoWorldModelMixin:
         world_model_debug_video_obs_xy_indices: Optional[List[int]] = None,
         world_model_debug_video_mode: str = "open_loop",
     ) -> None:
-        self.rollout_horizon = rollout_horizon
+        self.rollout_horizon = int(rollout_horizon)
+        self.rollout_horizon_min = (
+            None if rollout_horizon_min is None else int(rollout_horizon_min)
+        )
+        self.rollout_horizon_max = (
+            None if rollout_horizon_max is None else int(rollout_horizon_max)
+        )
+        self.rollout_horizon_ramp_steps = int(rollout_horizon_ramp_steps or 0)
         self.model_train_freq = model_train_freq
         self.ensemble_size = ensemble_size
         self.model_batch_size = model_batch_size
         self.real_ratio = real_ratio
+        self.syn_ratio = syn_ratio
         self.temperature = max(temperature, 1e-3)
         self.model_lr = model_lr
         self.model_hidden_size = model_hidden_size
@@ -948,6 +1091,13 @@ class _MbpoWorldModelMixin:
         self.warmup_steps = warmup_steps
         self.save_world_model_path = save_world_model_path
         self.save_world_model_interval = save_world_model_interval
+        self.oracle_reward = bool(oracle_reward)
+        self.oracle_reward_mode = str(oracle_reward_mode)
+        self.oracle_reward_goal_rel_indices = oracle_reward_goal_rel_indices
+        self.oracle_reward_scale = float(oracle_reward_scale)
+        self.oracle_reward_disable_reward_head_loss = bool(
+            oracle_reward_disable_reward_head_loss
+        )
         self.world_model_debug_video = bool(world_model_debug_video)
         self.world_model_debug_video_interval = int(world_model_debug_video_interval)
         self.world_model_debug_video_horizon = int(world_model_debug_video_horizon)
@@ -1045,6 +1195,39 @@ class _MbpoWorldModelMixin:
         self._world_model_rng = torch.Generator(device="cpu")
         self._world_model_rng.manual_seed(seed + 10_000_019)
 
+    def _current_rollout_horizon(self, group: str) -> int:
+        """Current synthetic rollout horizon.
+
+        If scheduling is enabled, linearly ramps horizon from `rollout_horizon_min` to
+        `rollout_horizon_max` over `rollout_horizon_ramp_steps` world-model training steps.
+        """
+        base = max(1, int(getattr(self, "rollout_horizon", 1)))
+        h_min = getattr(self, "rollout_horizon_min", None)
+        h_max = getattr(self, "rollout_horizon_max", None)
+        ramp = int(getattr(self, "rollout_horizon_ramp_steps", 0) or 0)
+
+        # Backward-compatible: no schedule.
+        if h_min is None and h_max is None:
+            return base
+        if ramp <= 0:
+            # No ramp => use max if provided, else min/base.
+            if h_max is not None:
+                return max(1, int(h_max))
+            if h_min is not None:
+                return max(1, int(h_min))
+            return base
+
+        h0 = max(1, int(h_min if h_min is not None else base))
+        h1 = max(1, int(h_max if h_max is not None else base))
+
+        step = int(getattr(self, "_train_steps", {}).get(group, 0))
+        # Warmup: before any training steps, keep horizon at h0.
+        if step <= 0:
+            return h0
+        frac = min(1.0, max(0.0, float(step) / float(ramp)))
+        h = int(round(h0 + (h1 - h0) * frac))
+        return max(1, h)
+
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
         # Ensure the synthetic buffer exists (created via get_replay_buffer()).
         # We don't create buffers here to avoid touching Experiment setup logic.
@@ -1092,6 +1275,21 @@ class _MbpoWorldModelMixin:
             if self._train_steps[group] > self.warmup_steps:
                 synthetic = self._generate_model_rollouts(group, flat_batch)
                 if synthetic is not None and synthetic.numel() > 0:
+                    # Optional lightweight debug: log how many synthetic transitions were generated
+                    # (helps confirm synthetic generation is actually happening).
+                    try:
+                        if hasattr(self.experiment, "logger") and self.experiment.logger is not None:
+                            step = getattr(self.experiment, "total_frames", self._train_steps[group])
+                            self.experiment.logger.log(
+                                {
+                                    f"world_model/{group}/synthetic/num_transitions": float(
+                                        int(synthetic.numel())
+                                    )
+                                },
+                                step=step,
+                            )
+                    except Exception:
+                        pass
                     synthetic = super().process_batch(group, synthetic)
                     if not self.has_rnn:
                         synthetic = synthetic.reshape(-1)
@@ -1142,6 +1340,164 @@ class _MbpoWorldModelMixin:
                 torch.float32
             )
         return action
+
+    def _oracle_reward_enabled(self) -> bool:
+        return bool(getattr(self, "oracle_reward", False))
+
+    def _oracle_reward_from_predicted_next_obs(
+        self, group: str, next_obs: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute oracle reward from predicted next observation.
+
+        Currently implemented mode:
+        - goal_distance_from_obs: reward = -||goal_rel_xy|| (per agent), where goal_rel_xy
+          comes from `oracle_reward_goal_rel_indices` in the observation vector.
+        """
+        mode = str(getattr(self, "oracle_reward_mode", "goal_distance_from_obs") or "").strip().lower()
+        if mode != "goal_distance_from_obs":
+            raise ValueError(
+                f"Unknown oracle_reward_mode={mode}. Currently supported: goal_distance_from_obs"
+            )
+        idx = getattr(self, "oracle_reward_goal_rel_indices", None)
+        if idx is None or not isinstance(idx, (list, tuple)) or len(idx) != 2:
+            raise ValueError(
+                "oracle_reward_goal_rel_indices must be a list/tuple of two ints when using "
+                "oracle_reward_mode=goal_distance_from_obs"
+            )
+        i0, i1 = int(idx[0]), int(idx[1])
+        if next_obs.shape[-1] <= max(i0, i1):
+            raise ValueError(
+                f"oracle_reward_goal_rel_indices out of bounds for group '{group}': "
+                f"max(idx)={max(i0,i1)} but obs_dim={next_obs.shape[-1]}"
+            )
+        rel = torch.stack([next_obs[..., i0], next_obs[..., i1]], dim=-1).to(torch.float32)
+        dist = torch.linalg.norm(rel, dim=-1, keepdim=True)  # [..., 1]
+        scale = float(getattr(self, "oracle_reward_scale", 1.0))
+        return (-dist * scale).to(next_obs.device)
+
+    @torch.no_grad()
+    def _world_model_eval_losses(
+        self, group: str, flat_batch: TensorDictBase
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute per-model evaluation losses on a batch WITHOUT bootstrap sampling.
+
+        Returns:
+            - losses_per_model: tensor of shape [ensemble_size] (total loss)
+            - metrics: dict with averaged components (obs_nll, rew_nll, done_bce, obs_mse, rew_mse)
+
+        Notes:
+            - This does not update model parameters.
+            - This does not update running reward normalization stats.
+        """
+        keys = flat_batch.keys(True, True)
+        if (group, "observation") not in keys or ("next", group, "observation") not in keys:
+            return torch.full((self.ensemble_size,), float("nan"), device=self.device), {}
+
+        obs = flat_batch.get((group, "observation")).to(self.device)
+        next_obs = flat_batch.get(("next", group, "observation")).to(self.device)
+        action = flat_batch.get((group, "action")).to(self.device)
+        reward = flat_batch.get(("next", group, "reward")).to(self.device)
+        done = flat_batch.get(("next", group, "done")).to(self.device)
+
+        obs = obs.reshape(-1, obs.shape[-2], obs.shape[-1])
+        next_obs = next_obs.reshape(-1, next_obs.shape[-2], next_obs.shape[-1])
+        action = action.reshape(-1, action.shape[-2], *action.shape[-1:])
+        reward = reward.reshape(-1, reward.shape[-2], reward.shape[-1])
+        done = done.reshape(-1, done.shape[-2], done.shape[-1])
+
+        action = self._encode_action(group, action)
+
+        if self.centralized_dynamics:
+            obs_flat = obs.reshape(obs.shape[0], -1)
+            next_obs_flat = next_obs.reshape(next_obs.shape[0], -1)
+            action_flat = action.reshape(action.shape[0], -1)
+            reward_flat = reward.squeeze(-1)
+            done_flat = done.squeeze(-1)
+        else:
+            obs_flat = obs.flatten(0, 1)
+            next_obs_flat = next_obs.flatten(0, 1)
+            action_flat = action.flatten(0, 1)
+            reward_flat = reward.flatten(0, 1)
+            done_flat = done.flatten(0, 1)
+
+        losses = []
+        total_loss_obs = 0.0
+        total_loss_rew = 0.0
+        total_loss_done = 0.0
+        total_mse_obs = 0.0
+        total_mse_rew = 0.0
+        total_r2_rew = 0.0
+        total_r2_obs = 0.0
+
+        # Reward normalization uses running mean/var if enabled (but we don't update them here).
+        use_rn = bool(getattr(self, "reward_normalize", False))
+        if use_rn:
+            eps = float(getattr(self, "reward_norm_eps", 1e-6))
+            r_mean = self._reward_running_mean[group]
+            r_std = torch.sqrt(self._reward_running_var[group].clamp_min(0.0)) + eps
+
+        for model in self._dynamics[group]:
+            mu_next, lv_delta, mu_rew, lv_rew, done_logit = model(obs_flat, action_flat)
+            inv_var_obs = torch.exp(-lv_delta)
+            inv_var_rew = torch.exp(-lv_rew)
+            loss_obs = torch.mean((mu_next - next_obs_flat) ** 2 * inv_var_obs + lv_delta)
+
+            # R^2 diagnostics (scale-free): compare to predicting the batch mean.
+            # These are computed on raw (non-normalized) targets.
+            rew_target = reward_flat.to(torch.float32)
+            rew_pred = mu_rew.to(torch.float32)
+            mse_rew = torch.mean((rew_pred - rew_target) ** 2)
+            var_rew = torch.mean((rew_target - rew_target.mean()) ** 2)
+            r2_rew = 1.0 - (mse_rew / (var_rew + 1e-12))
+
+            obs_target = next_obs_flat.to(torch.float32)
+            obs_pred = mu_next.to(torch.float32)
+            mse_obs = torch.mean((obs_pred - obs_target) ** 2)
+            var_obs = torch.mean((obs_target - obs_target.mean()) ** 2)
+            r2_obs = 1.0 - (mse_obs / (var_obs + 1e-12))
+
+            if use_rn:
+                r_n = (reward_flat - r_mean) / r_std
+                mu_rew_n = (mu_rew - r_mean) / r_std
+                lv_rew_n = lv_rew - 2.0 * torch.log(r_std)
+                inv_var_rew_n = torch.exp(-lv_rew_n)
+                loss_rew = torch.mean((mu_rew_n - r_n) ** 2 * inv_var_rew_n + lv_rew_n)
+            else:
+                loss_rew = torch.mean((mu_rew - reward_flat) ** 2 * inv_var_rew + lv_rew)
+            loss_rew = loss_rew * float(getattr(self, "reward_loss_coef", 1.0))
+            loss_done = F.binary_cross_entropy_with_logits(done_logit, done_flat.float())
+            loss = loss_obs + loss_rew + loss_done
+            losses.append(loss)
+
+            total_loss_obs += float(loss_obs.detach().cpu().item())
+            total_loss_rew += float(loss_rew.detach().cpu().item())
+            total_loss_done += float(loss_done.detach().cpu().item())
+            total_mse_obs += float(mse_obs.detach().cpu().item())
+            total_mse_rew += float(mse_rew.detach().cpu().item())
+            total_r2_obs += float(r2_obs.detach().cpu().item())
+            total_r2_rew += float(r2_rew.detach().cpu().item())
+
+        losses_t = torch.stack(losses, dim=0).to(self.device)
+        denom = max(1, len(self._dynamics[group]))
+        metrics = {
+            "eval/loss_observation": total_loss_obs / denom,
+            "eval/loss_reward": total_loss_rew / denom,
+            "eval/loss_done": total_loss_done / denom,
+            "eval/mse_observation": total_mse_obs / denom,
+            "eval/mse_reward": total_mse_rew / denom,
+            "eval/r2_observation": total_r2_obs / denom,
+            "eval/r2_reward": total_r2_rew / denom,
+            "eval/loss_total": float(losses_t.mean().detach().cpu().item()),
+        }
+        return losses_t, metrics
+
+    def _set_elites_from_losses(self, group: str, losses_per_model: torch.Tensor) -> None:
+        """Update elite indices given per-model losses (lower is better)."""
+        n_elites = self.n_elites or self.ensemble_size
+        n_elites = max(1, min(int(n_elites), self.ensemble_size))
+        # Ensure on device
+        l = losses_per_model.to(self.device)
+        self._elite_indices[group] = torch.argsort(l)[:n_elites]
 
     def _train_dynamics(self, group: str, flat_batch: TensorDictBase) -> None:
         keys = flat_batch.keys(True, True)
@@ -1249,7 +1605,12 @@ class _MbpoWorldModelMixin:
                 loss_rew = torch.mean((mu_rew_n - r_n) ** 2 * inv_var_rew_n + lv_rew_n)
             else:
                 loss_rew = torch.mean((mu_rew - r) ** 2 * inv_var_rew + lv_rew)
-            loss_rew = loss_rew * float(getattr(self, "reward_loss_coef", 1.0))
+            if self._oracle_reward_enabled() and bool(
+                getattr(self, "oracle_reward_disable_reward_head_loss", True)
+            ):
+                loss_rew = loss_rew * 0.0
+            else:
+                loss_rew = loss_rew * float(getattr(self, "reward_loss_coef", 1.0))
             loss_done = F.binary_cross_entropy_with_logits(done_logit, d.float())
             loss = loss_obs + loss_rew + loss_done
             loss.backward()
@@ -1612,13 +1973,19 @@ class _MbpoWorldModelMixin:
     def _generate_model_rollouts(
         self, group: str, flat_batch: TensorDictBase
     ) -> Optional[TensorDictBase]:
-        rr = float(getattr(self, "real_ratio", 1.0))
-        rr = min(max(rr, 0.0), 1.0)
-        target_synth = int(math.ceil(float(flat_batch.batch_size[0]) * (1.0 - rr)))
+        sr = getattr(self, "syn_ratio", None)
+        if sr is not None:
+            # New semantics: generate ~syn_ratio * N_real synthetic transitions per iteration.
+            target_synth = int(math.ceil(float(flat_batch.batch_size[0]) * max(0.0, float(sr))))
+        else:
+            # Backward-compatible semantics: target_synth ~= (1-real_ratio) * N_real.
+            rr = float(getattr(self, "real_ratio", 1.0))
+            rr = min(max(rr, 0.0), 1.0)
+            target_synth = int(math.ceil(float(flat_batch.batch_size[0]) * (1.0 - rr)))
         if target_synth <= 0:
             return None
 
-        horizon = max(1, int(getattr(self, "rollout_horizon", 1)))
+        horizon = max(1, int(self._current_rollout_horizon(group)))
         start_states = max(1, int(math.ceil(target_synth / float(horizon))))
 
         start = self._sample_start_states(group, flat_batch, start_states)
@@ -1632,6 +1999,9 @@ class _MbpoWorldModelMixin:
         n_agents = obs.shape[-2]
         done_mask = torch.zeros((*batch_dims, n_agents, 1), device=self.device, dtype=torch.bool)
 
+        # Each element in `rollouts` is one "time step" TensorDict with batch_size=[B].
+        # We'll stack these along dim=0 to produce a proper trajectory TensorDict with
+        # batch_size=[T, B], which is required for MAPPO's GAE computation.
         rollouts: List[TensorDictBase] = []
         # Try to preserve collector metadata when available (helps match replay buffer schema).
         traj_ids = None
@@ -1670,6 +2040,13 @@ class _MbpoWorldModelMixin:
             policy_group = policy_td.get(group)
 
             next_obs, reward_pred, done_logit = self._predict_next(group, obs, action)
+            # Optionally replace learned reward with oracle reward computed from predicted next state.
+            if self._oracle_reward_enabled():
+                try:
+                    reward_pred = self._oracle_reward_from_predicted_next_obs(group, next_obs)
+                except Exception:
+                    # If oracle reward can't be computed, fall back to learned reward head.
+                    pass
             done_prob = torch.sigmoid(done_logit)
             done_flag = done_prob > 0.5
             done_flag = done_flag | done_mask
@@ -1741,10 +2118,27 @@ class _MbpoWorldModelMixin:
 
         if not rollouts:
             return None
-        out = torch.cat(rollouts, dim=0)
-        # Enforce target synthetic dataset size for this iteration.
-        if out.shape[0] > target_synth:
-            out = out[:target_synth]
+
+        # Important: use stack (not cat) to preserve [T,B] structure.
+        out = torch.stack(rollouts, dim=0)
+
+        # Enforce an approximate target synthetic dataset size for this iteration while
+        # keeping the [T,B] structure (avoid flattening here; MAPPO needs time dimension).
+        #
+        # Total transitions ~= T * B. If we have too many, slice the batch dimension.
+        try:
+            T = int(out.batch_size[0])
+            B = int(out.batch_size[1]) if len(out.batch_size) > 1 else 1
+        except Exception:
+            T, B = len(rollouts), int(batch_dims[0]) if batch_dims else 1
+        if T > 0 and B > 1:
+            total = T * B
+            if total > target_synth:
+                # Keep as many start states as possible without exceeding the target (floor).
+                keep_B = max(1, min(B, int(target_synth // T)))
+                if keep_B < B:
+                    out = out[:, :keep_B]
+
         return out
 
     def save_world_model(self, filepath: str) -> None:
@@ -1776,10 +2170,16 @@ class _MbpoWorldModelMixin:
             },
             "config": {
                 "rollout_horizon": self.rollout_horizon,
+                "rollout_horizon_min": getattr(self, "rollout_horizon_min", None),
+                "rollout_horizon_max": getattr(self, "rollout_horizon_max", None),
+                "rollout_horizon_ramp_steps": int(
+                    getattr(self, "rollout_horizon_ramp_steps", 0) or 0
+                ),
                 "model_train_freq": self.model_train_freq,
                 "ensemble_size": self.ensemble_size,
                 "model_batch_size": self.model_batch_size,
                 "real_ratio": self.real_ratio,
+                "syn_ratio": getattr(self, "syn_ratio", None),
                 "temperature": self.temperature,
                 "model_lr": self.model_lr,
                 "model_hidden_size": self.model_hidden_size,
@@ -1795,6 +2195,13 @@ class _MbpoWorldModelMixin:
                 "min_log_var": self.min_log_var,
                 "max_log_var": self.max_log_var,
                 "warmup_steps": self.warmup_steps,
+                "oracle_reward": bool(getattr(self, "oracle_reward", False)),
+                "oracle_reward_mode": str(getattr(self, "oracle_reward_mode", "")),
+                "oracle_reward_goal_rel_indices": getattr(self, "oracle_reward_goal_rel_indices", None),
+                "oracle_reward_scale": float(getattr(self, "oracle_reward_scale", 1.0)),
+                "oracle_reward_disable_reward_head_loss": bool(
+                    getattr(self, "oracle_reward_disable_reward_head_loss", True)
+                ),
             },
         }
         torch.save(state_dict, path)
@@ -1820,10 +2227,16 @@ class _MbpoWorldModelMixin:
             loaded_config = state_dict.get("config", {})
             current_config = {
                 "rollout_horizon": self.rollout_horizon,
+                "rollout_horizon_min": getattr(self, "rollout_horizon_min", None),
+                "rollout_horizon_max": getattr(self, "rollout_horizon_max", None),
+                "rollout_horizon_ramp_steps": int(
+                    getattr(self, "rollout_horizon_ramp_steps", 0) or 0
+                ),
                 "model_train_freq": self.model_train_freq,
                 "ensemble_size": self.ensemble_size,
                 "model_batch_size": self.model_batch_size,
                 "real_ratio": self.real_ratio,
+                "syn_ratio": getattr(self, "syn_ratio", None),
                 "temperature": self.temperature,
                 "model_lr": self.model_lr,
                 "model_hidden_size": self.model_hidden_size,
@@ -1839,6 +2252,13 @@ class _MbpoWorldModelMixin:
                 "min_log_var": self.min_log_var,
                 "max_log_var": self.max_log_var,
                 "warmup_steps": self.warmup_steps,
+                "oracle_reward": bool(getattr(self, "oracle_reward", False)),
+                "oracle_reward_mode": str(getattr(self, "oracle_reward_mode", "")),
+                "oracle_reward_goal_rel_indices": getattr(self, "oracle_reward_goal_rel_indices", None),
+                "oracle_reward_scale": float(getattr(self, "oracle_reward_scale", 1.0)),
+                "oracle_reward_disable_reward_head_loss": bool(
+                    getattr(self, "oracle_reward_disable_reward_head_loss", True)
+                ),
             }
             for key, value in current_config.items():
                 if key in loaded_config and loaded_config[key] != value:
@@ -1914,6 +2334,10 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         model_lr: float,
         model_hidden_size: int,
         model_num_layers: int,
+        syn_ratio: Optional[float] = None,
+        rollout_horizon_min: Optional[int] = None,
+        rollout_horizon_max: Optional[int] = None,
+        rollout_horizon_ramp_steps: int = 0,
         reward_loss_coef: float = 1.0,
         reward_normalize: bool = False,
         reward_norm_alpha: float = 0.01,
@@ -1930,6 +2354,11 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
         save_world_model_interval: Optional[int] = None,
+        oracle_reward: bool = False,
+        oracle_reward_mode: str = "goal_distance_from_obs",
+        oracle_reward_goal_rel_indices: Optional[List[int]] = None,
+        oracle_reward_scale: float = 1.0,
+        oracle_reward_disable_reward_head_loss: bool = True,
         world_model_debug_video: bool = False,
         world_model_debug_video_interval: int = 200,
         world_model_debug_video_horizon: int = 50,
@@ -1942,6 +2371,9 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         super().__init__(**kwargs)
         self._mbpo_init(
             rollout_horizon=rollout_horizon,
+            rollout_horizon_min=rollout_horizon_min,
+            rollout_horizon_max=rollout_horizon_max,
+            rollout_horizon_ramp_steps=rollout_horizon_ramp_steps,
             model_train_freq=model_train_freq,
             ensemble_size=ensemble_size,
             model_batch_size=model_batch_size,
@@ -1950,6 +2382,7 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
             model_lr=model_lr,
             model_hidden_size=model_hidden_size,
             model_num_layers=model_num_layers,
+            syn_ratio=syn_ratio,
             reward_loss_coef=reward_loss_coef,
             reward_normalize=reward_normalize,
             reward_norm_alpha=reward_norm_alpha,
@@ -1966,6 +2399,11 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
             load_world_model_strict=load_world_model_strict,
             save_world_model_path=save_world_model_path,
             save_world_model_interval=save_world_model_interval,
+            oracle_reward=oracle_reward,
+            oracle_reward_mode=oracle_reward_mode,
+            oracle_reward_goal_rel_indices=oracle_reward_goal_rel_indices,
+            oracle_reward_scale=oracle_reward_scale,
+            oracle_reward_disable_reward_head_loss=oracle_reward_disable_reward_head_loss,
             world_model_debug_video=world_model_debug_video,
             world_model_debug_video_interval=world_model_debug_video_interval,
             world_model_debug_video_horizon=world_model_debug_video_horizon,
@@ -2011,6 +2449,10 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
         model_lr: float,
         model_hidden_size: int,
         model_num_layers: int,
+        syn_ratio: Optional[float] = None,
+        rollout_horizon_min: Optional[int] = None,
+        rollout_horizon_max: Optional[int] = None,
+        rollout_horizon_ramp_steps: int = 0,
         reward_loss_coef: float = 1.0,
         reward_normalize: bool = False,
         reward_norm_alpha: float = 0.01,
@@ -2027,6 +2469,11 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
         save_world_model_interval: Optional[int] = None,
+        oracle_reward: bool = False,
+        oracle_reward_mode: str = "goal_distance_from_obs",
+        oracle_reward_goal_rel_indices: Optional[List[int]] = None,
+        oracle_reward_scale: float = 1.0,
+        oracle_reward_disable_reward_head_loss: bool = True,
         world_model_debug_video: bool = False,
         world_model_debug_video_interval: int = 200,
         world_model_debug_video_horizon: int = 50,
@@ -2039,6 +2486,9 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
         super().__init__(**kwargs)
         self._mbpo_init(
             rollout_horizon=rollout_horizon,
+            rollout_horizon_min=rollout_horizon_min,
+            rollout_horizon_max=rollout_horizon_max,
+            rollout_horizon_ramp_steps=rollout_horizon_ramp_steps,
             model_train_freq=model_train_freq,
             ensemble_size=ensemble_size,
             model_batch_size=model_batch_size,
@@ -2047,6 +2497,7 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
             model_lr=model_lr,
             model_hidden_size=model_hidden_size,
             model_num_layers=model_num_layers,
+            syn_ratio=syn_ratio,
             reward_loss_coef=reward_loss_coef,
             reward_normalize=reward_normalize,
             reward_norm_alpha=reward_norm_alpha,
@@ -2063,6 +2514,11 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
             load_world_model_strict=load_world_model_strict,
             save_world_model_path=save_world_model_path,
             save_world_model_interval=save_world_model_interval,
+            oracle_reward=oracle_reward,
+            oracle_reward_mode=oracle_reward_mode,
+            oracle_reward_goal_rel_indices=oracle_reward_goal_rel_indices,
+            oracle_reward_scale=oracle_reward_scale,
+            oracle_reward_disable_reward_head_loss=oracle_reward_disable_reward_head_loss,
             world_model_debug_video=world_model_debug_video,
             world_model_debug_video_interval=world_model_debug_video_interval,
             world_model_debug_video_horizon=world_model_debug_video_horizon,
@@ -2090,6 +2546,10 @@ class MbpoConfig(MasacConfig):
     model_lr: float = MISSING
     model_hidden_size: int = MISSING
     model_num_layers: int = MISSING
+    syn_ratio: Optional[float] = None
+    rollout_horizon_min: Optional[int] = None
+    rollout_horizon_max: Optional[int] = None
+    rollout_horizon_ramp_steps: int = 0
     reward_loss_coef: float = 1.0
     reward_normalize: bool = False
     reward_norm_alpha: float = 0.01
@@ -2106,6 +2566,11 @@ class MbpoConfig(MasacConfig):
     load_world_model_strict: bool = True
     save_world_model_path: Optional[str] = None
     save_world_model_interval: Optional[int] = None
+    oracle_reward: bool = False
+    oracle_reward_mode: str = "goal_distance_from_obs"
+    oracle_reward_goal_rel_indices: Optional[List[int]] = None
+    oracle_reward_scale: float = 1.0
+    oracle_reward_disable_reward_head_loss: bool = True
     # Debug visualization: log a video comparing world-model predictions vs simulator transitions.
     world_model_debug_video: bool = False
     world_model_debug_video_interval: int = 200
@@ -2152,6 +2617,10 @@ class MbpoMappoConfig(MappoConfig):
     model_lr: float = MISSING
     model_hidden_size: int = MISSING
     model_num_layers: int = MISSING
+    syn_ratio: Optional[float] = None
+    rollout_horizon_min: Optional[int] = None
+    rollout_horizon_max: Optional[int] = None
+    rollout_horizon_ramp_steps: int = 0
     reward_loss_coef: float = 1.0
     reward_normalize: bool = False
     reward_norm_alpha: float = 0.01
@@ -2168,6 +2637,11 @@ class MbpoMappoConfig(MappoConfig):
     load_world_model_strict: bool = True
     save_world_model_path: Optional[str] = None
     save_world_model_interval: Optional[int] = None
+    oracle_reward: bool = False
+    oracle_reward_mode: str = "goal_distance_from_obs"
+    oracle_reward_goal_rel_indices: Optional[List[int]] = None
+    oracle_reward_scale: float = 1.0
+    oracle_reward_disable_reward_head_loss: bool = True
     world_model_debug_video: bool = False
     world_model_debug_video_interval: int = 200
     world_model_debug_video_horizon: int = 50

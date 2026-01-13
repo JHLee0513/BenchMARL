@@ -15,12 +15,30 @@ minibatch_advantage: False
 
 # MBPO-specific knobs
 rollout_horizon: 10
+# Optional: increase rollout horizon over training (synthetic rollouts).
+# If left null/0, `rollout_horizon` is used as a constant horizon.
+# Example: start at 5, ramp to 25 over 2000 train steps:
+# rollout_horizon_min: 5
+# rollout_horizon_max: 25
+# rollout_horizon_ramp_steps: 2000
+rollout_horizon_min: null
+rollout_horizon_max: null
+rollout_horizon_ramp_steps: 0
 model_train_freq: 1
 ensemble_size: 5
 # Number of elite models to sample from during rollouts (defaults to all if null)
 n_elites: null
 model_batch_size: 256
+# Mixing / batch sizing:
+# - If `syn_ratio` is null: backward-compatible behavior (real_ratio is a fraction, synthetic ~= (1-real_ratio)).
+# - If `syn_ratio` is set: new behavior (multipliers of the baseline minibatch size):
+#     n_real  ~= real_ratio * batch_size
+#     n_synth ~= syn_ratio  * batch_size
+# Example: keep 1x real minibatch and add 10x synthetic:
+#   real_ratio: 1.0
+#   syn_ratio: 10.0
 real_ratio: 0.5
+syn_ratio: null
 temperature: 1.0
 model_lr: 0.001
 model_hidden_size: 256

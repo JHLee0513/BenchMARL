@@ -245,6 +245,14 @@ class Algorithm(ABC):
             policies.append(self._policies_for_collection[group])
         return TensorDictSequential(*policies)
 
+    def train_minibatch_multiplier(self, group: str) -> int:
+        """Optional hook to scale optimizer minibatches without changing env steps.
+
+        Default is 1 for all algorithms. MBPO can override this to process synthetic data
+        in additional bounded-size minibatches rather than concatenating huge batches.
+        """
+        return 1
+
     def get_parameters(self, group: str) -> Dict[str, Iterable]:
         """
         Get the dictionary mapping loss names to the relative parameters to optimize for a given group.

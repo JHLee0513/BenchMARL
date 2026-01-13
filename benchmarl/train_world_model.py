@@ -68,6 +68,13 @@ class WorldModelTrainConfig:
     # Logging
     log_every: int = 10
 
+    # Validation
+    val_ratio: float = 0.1  # fraction of shards reserved for validation
+    eval_every_updates: int = 200  # run validation every N gradient updates
+    val_batches: int = 10  # number of minibatches to evaluate per group
+    val_batch_size: Optional[int] = None  # defaults to batch_size
+    update_elites_from_val: bool = True  # update elite indices using validation losses
+
 
 def _get_wm_cfg(cfg: DictConfig) -> WorldModelTrainConfig:
     d = {}
@@ -101,13 +108,39 @@ def _list_shards(dataset_dir: Path, max_shards: Optional[int]) -> List[Path]:
 
 def _required_keys_present(td: TensorDictBase, group: str) -> bool:
     keys = td.keys(True, True)
+    # Some collectors/envs store reward/done at the top level ("next","reward"/"next","done")
+    # instead of under the group. We'll accept either and later expand to group-level keys.
+    has_rew = ("next", group, "reward") in keys or ("next", "reward") in keys
+    has_done = ("next", group, "done") in keys or ("next", "done") in keys
     return (
         (group, "observation") in keys
         and (group, "action") in keys
         and ("next", group, "observation") in keys
-        and ("next", group, "reward") in keys
-        and ("next", group, "done") in keys
+        and has_rew
+        and has_done
     )
+
+
+def _ensure_group_reward_done(td: TensorDictBase, group: str) -> TensorDictBase:
+    """Ensure group-level reward/done keys exist by expanding top-level keys when needed."""
+    keys = td.keys(True, True)
+    # ("next", group, "reward")
+    if ("next", group, "reward") not in keys and ("next", "reward") in keys:
+        try:
+            rew = td.get(("next", "reward"))
+            rew = rew.expand(td.get(group).shape).unsqueeze(-1)
+            td.set(("next", group, "reward"), rew)
+        except Exception:
+            pass
+    # ("next", group, "done")
+    if ("next", group, "done") not in keys and ("next", "done") in keys:
+        try:
+            done = td.get(("next", "done"))
+            done = done.expand(td.get(group).shape).unsqueeze(-1)
+            td.set(("next", group, "done"), done)
+        except Exception:
+            pass
+    return td
 
 
 def _sample_minibatch(td: TensorDictBase, batch_size: int, *, generator: torch.Generator) -> TensorDictBase:
@@ -115,6 +148,24 @@ def _sample_minibatch(td: TensorDictBase, batch_size: int, *, generator: torch.G
     batch_size = min(max(1, int(batch_size)), max(1, n))
     idx = torch.randint(0, n, (batch_size,), device="cpu", generator=generator)
     return td[idx]
+
+
+def _split_train_val_shards(
+    shards: List[Path], val_ratio: float, *, seed: int
+) -> Tuple[List[Path], List[Path]]:
+    val_ratio = float(val_ratio)
+    val_ratio = min(max(val_ratio, 0.0), 0.9)
+    if not shards:
+        return [], []
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed) + 991_733)
+    perm = torch.randperm(len(shards), generator=g).tolist()
+    shards_shuf = [shards[i] for i in perm]
+    n_val = int(round(len(shards_shuf) * val_ratio))
+    n_val = max(0, min(n_val, len(shards_shuf) - 1))  # keep at least 1 train shard
+    val = shards_shuf[:n_val]
+    train = shards_shuf[n_val:]
+    return train, val
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
@@ -162,6 +213,11 @@ def hydra_train_world_model(cfg: DictConfig) -> None:
     shards = _list_shards(dataset_dir, wm_cfg.max_shards)
     if not shards:
         raise ValueError(f"No shards found in {str(dataset_dir)}")
+    train_shards, val_shards = _split_train_val_shards(
+        shards, wm_cfg.val_ratio, seed=int(cfg.seed)
+    )
+    if not train_shards:
+        raise ValueError("No training shards after train/val split.")
 
     save_path = Path(wm_cfg.save_path)
     if not save_path.is_absolute():
@@ -173,14 +229,18 @@ def hydra_train_world_model(cfg: DictConfig) -> None:
     rng.manual_seed(int(cfg.seed) + 202_601_08)
 
     total_updates = 0
+    import random
+    random.seed(int(cfg.seed) + 202_601_08)
     for epoch in range(max(1, int(wm_cfg.epochs))):
-        for shard_i, shard_path in enumerate(shards):
-            td: TensorDictBase = torch.load(shard_path, map_location=wm_cfg.load_device)
+        random.shuffle(train_shards)
+        for shard_i, shard_path in enumerate(train_shards):
+            td: TensorDictBase = torch.load(shard_path, map_location=wm_cfg.load_device, weights_only=False)
             td = td.detach()
             try:
                 td = td.reshape(-1)
             except Exception:
-                pass
+                # If a shard has unexpected structure, skip it rather than breaking the run.
+                continue
 
             # Train per group (MBPO trains per group model ensemble).
             for group in experiment.group_map.keys():
@@ -188,8 +248,70 @@ def hydra_train_world_model(cfg: DictConfig) -> None:
                     continue
                 for u in range(max(1, int(wm_cfg.updates_per_shard))):
                     mb = _sample_minibatch(td, batch_size, generator=rng)
+                    mb = _ensure_group_reward_done(mb, group)
                     algo._train_dynamics(group, mb)  # type: ignore[attr-defined]
                     total_updates += 1
+
+                    # Periodic validation.
+                    if (
+                        val_shards
+                        and int(wm_cfg.eval_every_updates) > 0
+                        and (total_updates % int(wm_cfg.eval_every_updates) == 0)
+                        and hasattr(algo, "_world_model_eval_losses")
+                    ):
+                        val_bs = int(wm_cfg.val_batch_size or batch_size)
+                        val_bs = max(1, val_bs)
+                        n_val_batches = max(1, int(wm_cfg.val_batches))
+
+                        per_group_losses: Dict[str, List[torch.Tensor]] = {}
+                        per_group_metrics_sum: Dict[str, Dict[str, float]] = {}
+                        per_group_metrics_n: Dict[str, int] = {}
+
+                        for _ in range(n_val_batches):
+                            shard_path_v = val_shards[
+                                int(torch.randint(0, len(val_shards), (1,), generator=rng).item())
+                            ]
+                            tdv: TensorDictBase = torch.load(
+                                shard_path_v, map_location=wm_cfg.load_device, weights_only=False
+                            ).detach()
+                            try:
+                                tdv = tdv.reshape(-1)
+                            except Exception:
+                                continue
+
+                            for g in experiment.group_map.keys():
+                                if not _required_keys_present(tdv, g):
+                                    continue
+                                mbv = _sample_minibatch(tdv, val_bs, generator=rng)
+                                mbv = _ensure_group_reward_done(mbv, g)
+                                losses_per_model, metrics = algo._world_model_eval_losses(g, mbv)  # type: ignore[attr-defined]
+                                per_group_losses.setdefault(g, []).append(losses_per_model.detach())
+                                per_group_metrics_sum.setdefault(g, {})
+                                for k, v in metrics.items():
+                                    per_group_metrics_sum[g][k] = per_group_metrics_sum[g].get(k, 0.0) + float(v)
+                                per_group_metrics_n[g] = per_group_metrics_n.get(g, 0) + 1
+
+                        for g, losses_list in per_group_losses.items():
+                            losses_stack = torch.stack(losses_list, dim=0)  # [n, ensemble]
+                            mean_losses = losses_stack.mean(dim=0)
+                            if wm_cfg.update_elites_from_val and hasattr(algo, "_set_elites_from_losses"):
+                                try:
+                                    algo._set_elites_from_losses(g, mean_losses)  # type: ignore[attr-defined]
+                                except Exception:
+                                    pass
+
+                            n = max(1, per_group_metrics_n.get(g, 0))
+                            metrics_mean = {
+                                k: v / n for k, v in per_group_metrics_sum.get(g, {}).items()
+                            }
+                            print(
+                                f"[train_world_model][val] epoch={epoch} update={total_updates} group={g} "
+                                f"loss_total={metrics_mean.get('eval/loss_total', float('nan')):.6f} "
+                                f"obs_mse={metrics_mean.get('eval/mse_observation', float('nan')):.6f} "
+                                f"rew_mse={metrics_mean.get('eval/mse_reward', float('nan')):.6f} "
+                                f"obs_r2={metrics_mean.get('eval/r2_observation', float('nan')):.3f} "
+                                f"rew_r2={metrics_mean.get('eval/r2_reward', float('nan')):.3f}"
+                            )
                     if wm_cfg.log_every and (total_updates % int(wm_cfg.log_every) == 0):
                         # Best-effort: print current mean loss across ensemble if available.
                         losses = getattr(algo, "_model_losses", {}).get(group, None)
@@ -197,7 +319,7 @@ def hydra_train_world_model(cfg: DictConfig) -> None:
                             try:
                                 mean_loss = float(losses.mean().detach().cpu().item())
                                 print(
-                                    f"[train_world_model] epoch={epoch} shard={shard_i}/{len(shards)} "
+                                    f"[train_world_model] epoch={epoch} shard={shard_i}/{len(train_shards)} "
                                     f"group={group} updates={total_updates} mean_loss={mean_loss:.6f}"
                                 )
                             except Exception:

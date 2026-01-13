@@ -34,6 +34,8 @@ Gaussian noise around reference (continuous actions only):
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -96,6 +98,17 @@ class CollectConfig:
     # Avoid creating W&B / CSV logs for the auxiliary policy experiments.
     disable_loggers: bool = True
 
+    # Dataset utilities
+    # Merge one or more existing datasets created by this script into a single dataset directory.
+    # Example:
+    #   python benchmarl/collect.py task=... algorithm=... ++collect.merge_from=dataset/a,dataset/b ++collect.merge_output_dir=dataset/merged
+    merge_from: Optional[str] = None
+    merge_output_dir: Optional[str] = None
+    # How to materialize shard files in the merged dataset:
+    # - "copy": copy shard files into the merged directory (most portable)
+    # - "hardlink": create hardlinks (fast, but requires same filesystem)
+    merge_mode: str = "copy"
+
 
 def _get_collect_cfg(cfg: DictConfig) -> CollectConfig:
     # Users can pass `++collect.*` overrides even though the base config has no collect section.
@@ -132,6 +145,119 @@ def _parse_weights(s: Optional[str], n: int) -> Optional[List[float]]:
     if any(v < 0 for v in w) or sum(w) <= 0:
         raise ValueError("collect.policy_weights must be non-negative and sum to > 0")
     return w
+
+
+def _read_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _iter_index_records(dataset_dir: Path) -> List[Dict[str, Any]]:
+    """Load index records from index.jsonl; fall back to scanning batch_*.pt."""
+    idx = dataset_dir / "index.jsonl"
+    recs: List[Dict[str, Any]] = []
+    if idx.exists():
+        for line in idx.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                recs.append(json.loads(line))
+            except Exception:
+                continue
+        return recs
+
+    # Fallback: scan shard files
+    for p in sorted(dataset_dir.glob("batch_*.pt")):
+        recs.append({"path": p.name, "numel": None})
+    return recs
+
+
+def merge_datasets(
+    *,
+    input_dirs: List[Path],
+    output_dir: Path,
+    mode: str = "copy",
+) -> None:
+    """Merge datasets created by this script into one directory.
+
+    Produces:
+    - output_dir/meta.json: a merged meta containing a list of source metas
+    - output_dir/index.jsonl: concatenated records with rewritten shard paths
+    - shard files copied/hardlinked into output_dir
+    """
+    if not input_dirs:
+        raise ValueError("merge_datasets: input_dirs is empty")
+    mode = str(mode or "copy").strip().lower()
+    if mode not in ("copy", "hardlink"):
+        raise ValueError("collect.merge_mode must be 'copy' or 'hardlink'")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    source_metas: List[Dict[str, Any]] = []
+    merged_from: List[str] = []
+    merged_records: List[Dict[str, Any]] = []
+    batch_idx = 0
+
+    for src_i, src in enumerate(input_dirs):
+        if not src.exists() or not src.is_dir():
+            raise FileNotFoundError(f"merge_datasets: dataset dir not found: {str(src)}")
+
+        merged_from.append(str(src))
+        meta = _read_json(src / "meta.json")
+        if meta is not None:
+            source_metas.append(meta)
+
+        recs = _iter_index_records(src)
+        for rec in recs:
+            rel = str(rec.get("path", "")).strip()
+            if not rel:
+                continue
+            shard_src = src / rel
+            if not shard_src.exists():
+                # Skip missing shards rather than failing the whole merge.
+                continue
+
+            # Ensure unique shard names even if multiple datasets used the same batch_* naming.
+            new_name = f"src{src_i}_{Path(rel).name}"
+            shard_dst = output_dir / new_name
+
+            if not shard_dst.exists():
+                if mode == "hardlink":
+                    try:
+                        os.link(shard_src, shard_dst)
+                    except Exception:
+                        # Fall back to copy if hardlink fails (different filesystem / permissions).
+                        shutil.copy2(shard_src, shard_dst)
+                else:
+                    shutil.copy2(shard_src, shard_dst)
+
+            merged_records.append(
+                {
+                    "batch_idx": batch_idx,
+                    "path": shard_dst.name,
+                    "numel": int(rec["numel"]) if rec.get("numel") is not None else None,
+                    "source_dir": str(src),
+                }
+            )
+            batch_idx += 1
+
+    # Write merged index.jsonl
+    index_path = output_dir / "index.jsonl"
+    with index_path.open("w", encoding="utf-8") as f:
+        for rec in merged_records:
+            f.write(json.dumps(rec) + "\n")
+
+    # Write merged meta.json
+    merged_meta: Dict[str, Any] = {
+        "merged_from": merged_from,
+        "num_sources": len(input_dirs),
+        "num_shards": len(merged_records),
+        "source_metas": source_metas,
+    }
+    (output_dir / "meta.json").write_text(json.dumps(merged_meta, indent=2), encoding="utf-8")
 
 
 def _rand_discrete_from_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -436,6 +562,21 @@ def hydra_collect(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
     collect_cfg = _get_collect_cfg(cfg)
+
+    # Utility mode: merge existing datasets and exit.
+    merge_tokens = _parse_csv(collect_cfg.merge_from)
+    if merge_tokens:
+        out_dir = Path(collect_cfg.merge_output_dir or _default_output_dir())
+        print("\n[collect] Merge mode enabled")
+        print(f"[collect] Inputs: {merge_tokens}")
+        print(f"[collect] Output: {str(out_dir)}")
+        merge_datasets(
+            input_dirs=[Path(p) for p in merge_tokens],
+            output_dir=out_dir,
+            mode=str(collect_cfg.merge_mode),
+        )
+        print(f"\n[collect] Merged dataset written to: {str(out_dir)}")
+        return
 
     # Base experiment (used for env specs + (optional) reference policy when collect.policy=reference).
     # We disable loggers by default for collection to avoid creating extra W&B/CSV artifacts.
