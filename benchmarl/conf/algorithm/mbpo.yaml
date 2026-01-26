@@ -37,9 +37,12 @@ model_lr: 0.001
 model_hidden_size: 256
 model_num_layers: 2
 reward_loss_coef: 1.0
+# Scaling coefficient for log-variance term in NLL loss. 
+# Lower values (e.g., 0.5) prevent the model from exploiting high uncertainty to make loss negative.
+# Default: 1.0 (standard NLL), but 0.5 is often more stable.
+logvar_loss_coef: 0.5
 reward_normalize: False
-reward_norm_alpha: 0.01
-reward_norm_eps: 1e-6
+state_normalize: False
 separate_reward_net: False
 stochastic_dynamics: True
 min_log_var: -10.0
@@ -59,4 +62,5 @@ save_world_model_path: null
 # Interval (in training steps) for automatic world model saving. 
 # If null, saves after each training step. Set to a positive integer to save periodically.
 save_world_model_interval: null
+
 

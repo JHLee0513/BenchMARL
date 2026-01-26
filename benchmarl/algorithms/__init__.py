@@ -13,6 +13,12 @@ from .isac import Isac, IsacConfig
 from .maddpg import Maddpg, MaddpgConfig
 from .mappo import Mappo, MappoConfig
 from .mbpo import Mbpo, MbpoConfig, MbpoMappo, MbpoMappoConfig, MbpoMasac
+from .mbpo_recurrent import (
+    MbpoRecurrentMasac,
+    MbpoRecurrentConfig,
+    MbpoRecurrentMappo,
+    MbpoRecurrentMappoConfig,
+)
 from .gnn_mbpo import Gmpo, GmpoConfig
 from .gnn_mbpo import GmpoMappo, GmpoMappoConfig
 from .masac import Masac, MasacConfig
@@ -37,6 +43,10 @@ classes = [
     "MbpoMasac",
     "MbpoMappo",
     "MbpoMappoConfig",
+    "MbpoRecurrentMasac",
+    "MbpoRecurrentConfig",
+    "MbpoRecurrentMappo",
+    "MbpoRecurrentMappoConfig",
     "Gmpo",
     "GmpoConfig",
     "GmpoMappo",
@@ -59,6 +69,8 @@ algorithm_config_registry = {
     "masac": MasacConfig,
     "mbpo": MbpoConfig,
     "mbpo_mappo": MbpoMappoConfig,
+    "mbpo_recurrent": MbpoRecurrentConfig,
+    "mbpo_recurrent_mappo": MbpoRecurrentMappoConfig,
     "gmpo": GmpoConfig,
     "gmpo_mappo": GmpoMappoConfig,
     "isac": IsacConfig,

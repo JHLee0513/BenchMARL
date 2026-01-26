@@ -1,0 +1,53 @@
+defaults:
+  - mbpo_recurrent_config
+  - _self_
+
+# MASAC backbone defaults
+share_param_critic: True
+num_qvalue_nets: 2
+loss_function: "l2"
+delay_qvalue: True
+target_entropy: "auto"
+discrete_target_entropy_weight: 0.2
+alpha_init: 1.0
+min_alpha: null
+max_alpha: null
+fixed_alpha: False
+scale_mapping: "biased_softplus_1.0"
+use_tanh_normal: True
+coupled_discrete_values: True
+
+# MBPO-specific knobs
+warmup_steps: 2500
+rollout_horizon: 10
+model_train_freq: 1
+ensemble_size: 5
+n_elites: null
+model_batch_size: 256
+real_ratio: 0.5
+syn_ratio: null
+temperature: 1.0
+model_lr: 0.001
+model_hidden_size: 256
+model_num_layers: 2
+reward_loss_coef: 1.0
+logvar_loss_coef: 0.5
+reward_normalize: False
+state_normalize: False
+separate_reward_net: False
+stochastic_dynamics: True
+min_log_var: -10.0
+max_log_var: -2.0
+centralized_dynamics: False
+
+# Recurrent world model
+history_length: 0  # 0 = same as standard MBPO; >0 uses GRU over past states
+future_length: 1
+gru_num_layers: 1
+
+# Paths for loading/saving world model
+load_world_model_path: null
+load_world_model_strict: True
+save_world_model_path: null
+save_world_model_interval: null
+

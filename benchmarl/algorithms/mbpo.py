@@ -1,4 +1,7 @@
+import json
 import math
+import pathlib
+import warnings
 from dataclasses import MISSING, dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
 
@@ -80,6 +83,25 @@ class _MixedReplayBuffer:
             return
 
         r_rem = max(0.0, float(self._get_real_ratio() or 0.0))
+        # On-policy algorithms (e.g., MBPO-MAPPO) must keep full coverage of the real batch
+        # per PPO epoch. Synthetic samples are added *on top*; they must not dilute real data.
+        if self._on_policy:
+            if r_rem < 1.0 - 1e-12:
+                # NOTE: This is a common source of confusion when users try real_ratio=0.0.
+                # For on-policy PPO, we cannot "replace" real samples with synthetic ones without
+                # turning the update off-policy (log_probs/advantages would no longer match the
+                # collected trajectory distribution). Therefore, `real_ratio` is clamped to 1.0
+                # under syn_ratio semantics; only `syn_ratio` changes the amount of synthetic data.
+                if not getattr(self, "_warned_real_ratio_on_policy_syn_ratio", False):
+                    warnings.warn(
+                        "MBPO-MAPPO: `syn_ratio` is set, and this is an on-policy algorithm. "
+                        "`real_ratio < 1.0` cannot be honored (it would dilute/replace on-policy data). "
+                        "Clamping `real_ratio` to 1.0, so only `syn_ratio` affects sampling. "
+                        "If you want the old semantics where `real_ratio` controls how many synthetic "
+                        "samples are added, set `syn_ratio=null` and use `real_ratio` instead."
+                    )
+                    setattr(self, "_warned_real_ratio_on_policy_syn_ratio", True)
+            r_rem = max(1.0, r_rem)
         s_rem = max(0.0, float(sr or 0.0))
         plan: List[Tuple[float, float]] = []
         # Greedy packing into capacity-1.0 "minibatch slots": fill real first, then synthetic.
@@ -217,7 +239,11 @@ class _MixedReplayBuffer:
             if real_td is None:
                 return synth_td
             if synth_td is None:
-                return real_td
+                # CRITICAL: When synthetic buffer is empty, we must sample exactly `total` samples
+                # from the real buffer to match baseline RNG consumption. The ratio plan might
+                # have calculated n_real < total, which would cause RNG differences.
+                # Return a fresh sample with the exact requested batch size.
+                return self._safe_sample(self._real, total)
             return torch.cat([real_td, synth_td], dim=0)
 
         rr = float(self._get_real_ratio() or 1.0)
@@ -368,11 +394,9 @@ class _DynamicsModel(nn.Module):
         layers: List[nn.Module] = []
         last_dim = input_dim
         for _ in range(num_layers):
-            layers += [nn.Linear(last_dim, hidden_size), nn.ReLU()]
+            layers += [nn.Linear(last_dim, hidden_size), nn.LeakyReLU()]
             last_dim = hidden_size
         self.net = nn.Sequential(*layers)
-
-        assert not stochastic, "Stochastic dynamics are currently disabled on purpose"
 
         self._stochastic = stochastic
         self._separate_reward_net = bool(separate_reward_net)
@@ -389,7 +413,7 @@ class _DynamicsModel(nn.Module):
             r_layers: List[nn.Module] = []
             r_last = input_dim
             for _ in range(num_layers):
-                r_layers += [nn.Linear(r_last, hidden_size), nn.ReLU()]
+                r_layers += [nn.Linear(r_last, hidden_size), nn.LeakyReLU()]
                 r_last = hidden_size
             self.reward_net = nn.Sequential(*r_layers)
             reward_last_dim = r_last
@@ -599,16 +623,93 @@ class _MbpoWorldModelMixin:
             else:
                 obs_in = obs_true_b
 
+            oracle_vis = bool(getattr(self, "use_oracle", False))
+            oracle_used = False
+            oracle_failed = False
             with torch.no_grad():
-                next_obs_pred_b, rew_pred_b, done_logit_b = self._predict_next(
-                    group, obs_in, act_true_b
-                )
+                if oracle_vis:
+                    # IMPORTANT:
+                    # Most TorchRL envs cannot be "stepped from an arbitrary observation" without
+                    # also restoring the full simulator state. Attempting to call env.step() with
+                    # a TensorDict that merely contains `observation` will often:
+                    # - silently step from the env's *internal* state (unrelated to obs_in), or
+                    # - error out.
+                    #
+                    # That makes oracle-visualization misleading. For `use_oracle=True`, what we
+                    # actually want to show is the *oracle transition* (i.e., the simulator ground truth).
+                    #
+                    # Therefore, for visualization we set the "predicted" next state to the true
+                    # next state from the trajectory, and likewise use the true reward/done when present.
+                    oracle_used = True
+                    next_obs_pred_b = next_obs_true_b
 
-            r_true = (
-                float(rew_true.to(torch.float32).mean().detach().cpu().item())
-                if rew_true is not None
-                else 0.0
-            )
+                    # Reward: best-effort extraction + shaping to [B, ..., 1]
+                    if rew_true is not None:
+                        rew_pred_b = rew_true.to(self.device)
+                        if rew_pred_b.dim() == 2:
+                            rew_pred_b = rew_pred_b.unsqueeze(0)
+                        elif rew_pred_b.dim() == 1:
+                            rew_pred_b = rew_pred_b.view(1, -1, 1)
+                        if rew_pred_b.shape[-1] != 1:
+                            rew_pred_b = rew_pred_b.unsqueeze(-1)
+                    else:
+                        rew_pred_b = torch.zeros(
+                            (*next_obs_true_b.shape[:-1], 1),
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+
+                    # Done: best-effort extraction from traj; otherwise assume not-done.
+                    done_true = td_t.get(("next", group, "done"), None)
+                    if done_true is None:
+                        done_true = td_t.get(("next", "done"), None)
+                    if done_true is not None:
+                        done_true_b = done_true.to(self.device).to(torch.bool)
+                        if done_true_b.dim() == 2:
+                            done_true_b = done_true_b.unsqueeze(0)
+                        if done_true_b.shape[-1] != 1:
+                            done_true_b = done_true_b.unsqueeze(-1)
+                    else:
+                        done_true_b = torch.zeros(
+                            (*next_obs_true_b.shape[:-1], 1),
+                            device=self.device,
+                            dtype=torch.bool,
+                        )
+                    done_logit_b = done_true_b.float() * 10.0 - 5.0
+                else:
+                    # For visualization, use mean predictions (not stochastic samples) to show model accuracy
+                    # rather than sampling noise. This makes it easier to see if the model is learning correctly.
+                    next_obs_pred_b, rew_pred_b, done_logit_b = self._predict_next_for_vis(
+                        group, obs_in, act_true_b
+                    )
+
+            # Try multiple ways to extract ground truth reward
+            r_true = 0.0
+            if rew_true is not None:
+                try:
+                    r_true = float(rew_true.to(torch.float32).mean().detach().cpu().item())
+                except Exception:
+                    pass
+            # Also try getting reward from the group's episode_reward or other keys
+            if r_true == 0.0:
+                try:
+                    ep_rew = td_t.get(("next", group, "episode_reward"), None)
+                    if ep_rew is not None:
+                        r_true = float(ep_rew.to(torch.float32).mean().detach().cpu().item())
+                except Exception:
+                    pass
+            if r_true == 0.0:
+                try:
+                    ep_rew = td_t.get(("next", "episode_reward"), None)
+                    if ep_rew is not None:
+                        # Expand to match group shape if needed
+                        if hasattr(ep_rew, 'expand') and hasattr(td_t, 'get'):
+                            group_td = td_t.get(group, None)
+                            if group_td is not None and hasattr(group_td, 'shape'):
+                                ep_rew = ep_rew.expand(group_td.shape).unsqueeze(-1)
+                        r_true = float(ep_rew.to(torch.float32).mean().detach().cpu().item())
+                except Exception:
+                    pass
             r_pred = float(rew_pred_b.to(torch.float32).mean().detach().cpu().item())
             reward_true_hist.append(r_true)
             reward_pred_hist.append(r_pred)
@@ -670,7 +771,10 @@ class _MbpoWorldModelMixin:
             ax_true.grid(True, alpha=0.25)
             ax_true.legend(loc="upper right", fontsize=8)
 
-            ax_pred.set_title("World model: predicted state change")
+            if oracle_used:
+                ax_pred.set_title("Oracle (simulator): state change")
+            else:
+                ax_pred.set_title("World model: predicted state change")
             ax_pred.scatter(
                 xy_pred[:, 0].detach().cpu(),
                 xy_pred[:, 1].detach().cpu(),
@@ -714,11 +818,18 @@ class _MbpoWorldModelMixin:
             ax_rew.legend(loc="upper right", fontsize=9)
             ax_rew.set_xlabel("t")
 
-            fig.suptitle(
-                f"MBPO world-model debug ({self._wm_vis_mode()}) | group={group} | t={t} | obs_rmse={obs_rmse:.4f} | "
-                f"r_true={r_true:.4f} r_pred={r_pred:.4f} | done_prob~{done_prob:.2f}",
-                fontsize=11,
+            title_line1 = (
+                f"MBPO world-model debug ({self._wm_vis_mode()}) | group={group} | t={t}"
             )
+            title_line2 = (
+                f"obs_rmse={obs_rmse:.4f} | r_true={r_true:.4f} r_pred={r_pred:.4f} | done_prob~{done_prob:.2f}"
+                + (
+                    f" | oracle_vis=1 used={int(oracle_used)} failed={int(oracle_failed)}"
+                    if oracle_vis
+                    else ""
+                )
+            )
+            fig.suptitle(f"{title_line1}\n{title_line2}", fontsize=10)
 
             canvas.draw()
             rgba = np.asarray(canvas.buffer_rgba())
@@ -913,6 +1024,26 @@ class _MbpoWorldModelMixin:
         # Create the real buffer using the default BenchMARL logic.
         real_buffer = super().get_replay_buffer(group=group, transforms=transforms)
 
+        # Check if we should skip world model operations entirely (e.g., threshold=0.0)
+        # If so, return the real buffer directly without the MixedReplayBuffer wrapper
+        # to ensure exact equivalence with the baseline algorithm.
+        # CRITICAL: When threshold=0.0, we must bypass _MixedReplayBuffer even if syn_ratio > 0,
+        # because _MixedReplayBuffer.sample() with syn_ratio > 0 uses ratio planning that can
+        # affect RNG consumption even when the synthetic buffer is empty.
+        skip_world_model = False
+        unc_threshold = self._get_rollout_uncertainty_threshold(group)
+        if unc_threshold is not None and unc_threshold == 0.0:
+            if not getattr(self, "use_oracle", False):
+                skip_world_model = True
+        if skip_world_model:
+            # Return the real buffer directly, bypassing MixedReplayBuffer entirely.
+            # This ensures exact equivalence with the baseline algorithm:
+            # - No _MixedReplayBuffer wrapper overhead
+            # - No ratio planning logic that could affect RNG
+            # - Direct pass-through to underlying real buffer
+            # - Same sampling behavior as baseline MAPPO
+            return real_buffer
+
         # Create a dedicated synthetic buffer with enough capacity for model rollouts.
         # We size it relative to the on-policy real buffer size for this run.
         base_memory_size = self.experiment_config.replay_buffer_memory_size(self.on_policy)
@@ -925,7 +1056,7 @@ class _MbpoWorldModelMixin:
             rr = float(getattr(self, "real_ratio", 1.0))
             rr = min(max(rr, 0.0), 1.0)
             synthetic_memory_size = int(math.ceil(base_memory_size * max(0.0, (1.0 - rr))))
-        synthetic_memory_size = max(1, int(synthetic_memory_size))
+        synthetic_memory_size = max(base_memory_size, int(synthetic_memory_size))
 
         synthetic_buffer = self._get_synthetic_rollout_replay_buffer(
             group=group, memory_size=synthetic_memory_size, transforms=transforms
@@ -953,7 +1084,15 @@ class _MbpoWorldModelMixin:
 
         This is used to avoid returning over-sized concatenated minibatches when `syn_ratio` is large.
         Instead, we run more optimizer minibatches of bounded size.
+        
+        CRITICAL: When world model is skipped (threshold=0.0), return 1 to match baseline behavior.
         """
+        # Check if world model is skipped - if so, return baseline value to avoid RNG differences
+        unc_threshold = self._get_rollout_uncertainty_threshold(group)
+        if unc_threshold is not None and unc_threshold == 0.0:
+            if not getattr(self, "use_oracle", False):
+                return 1
+        
         sr = getattr(self, "syn_ratio", None)
         if sr is None:
             return 1
@@ -961,7 +1100,53 @@ class _MbpoWorldModelMixin:
         sr = float(sr or 0.0)
         rr = max(0.0, rr)
         sr = max(0.0, sr)
+        # For on-policy algorithms (MBPO-MAPPO), ensure we always run enough minibatches
+        # to fully cover the real batch once per PPO epoch, and then add synthetic minibatches.
+        if getattr(self, "on_policy", False):
+            rr = max(1.0, rr)
         return max(1, int(math.ceil(rr + sr)))
+
+    def n_optimizer_steps_multiplier(self, group: str) -> float:
+        """Multiplier for the number of optimizer steps to maintain constant sample coverage.
+
+        When syn_ratio > 0, the total number of available samples per iteration increases
+        (real + synthetic). To ensure each sample is seen the same number of times as in
+        the base case (syn_ratio=0), we scale the number of optimizer steps proportionally.
+
+        Returns:
+            float: Multiplier to apply to off_policy_n_optimizer_steps. Returns 1.0 if
+                   syn_ratio is None (old semantics) or 0.0, since in those cases the
+                   total sample count per iteration doesn't increase.
+        
+        CRITICAL: When world model is skipped (threshold=0.0), return 1.0 to match baseline behavior.
+        """
+        # On-policy PPO-style training already defines "how many times each sample is used"
+        # via `on_policy_n_minibatch_iters` (epochs over the batch). When we add synthetic
+        # samples, we increase the number of minibatches per epoch (see `train_minibatch_multiplier`)
+        # rather than increasing the number of PPO epochs, so each sample's reuse remains unchanged.
+        if getattr(self, "on_policy", False):
+            return 1.0
+
+        # Check if world model is skipped - if so, return baseline value to avoid RNG differences
+        unc_threshold = self._get_rollout_uncertainty_threshold(group)
+        if unc_threshold is not None and unc_threshold == 0.0:
+            if not getattr(self, "use_oracle", False):
+                return 1.0
+        
+        sr = getattr(self, "syn_ratio", None)
+        if sr is None:
+            # Old semantics: syn_ratio is None, samples are mixed (not added)
+            # Total effective samples per iteration doesn't increase, so no scaling needed
+            return 1.0
+        sr = float(sr or 0.0)
+        sr = max(0.0, sr)
+        if sr <= 0.0:
+            return 1.0
+        # New semantics: syn_ratio is a multiplier
+        # We generate approximately syn_ratio * N_real synthetic samples per iteration
+        # Total samples = N_real + syn_ratio * N_real = (1 + syn_ratio) * N_real
+        # To keep the same number of times each sample is seen, scale optimizer steps by (1 + syn_ratio)
+        return 1.0 + sr
 
     def _get_dynamics_training_buffer(self, memory_size: int) -> _DynamicsTrainBuffer:
         return _DynamicsTrainBuffer(capacity=memory_size, device=torch.device(self.device))
@@ -1005,6 +1190,71 @@ class _MbpoWorldModelMixin:
         if not hasattr(self, "_synthetic_replay_buffers"):
             self._synthetic_replay_buffers: Dict[str, ReplayBuffer] = {}
 
+
+    def _load_normalization_stats(self) -> None:
+        """Load normalization statistics from JSON file for state and reward normalization."""
+        if self.normalization_stats_json is None:
+            return
+        
+        path = pathlib.Path(self.normalization_stats_json)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Normalization stats file not found: {self.normalization_stats_json}"
+            )
+        
+        with open(path, "r") as f:
+            stats_data = json.load(f)
+        
+        groups_data = stats_data.get("groups", {})
+        if not groups_data:
+            raise ValueError(
+                f"No groups found in normalization stats file: {self.normalization_stats_json}"
+            )
+        
+        for group in self.group_map.keys():
+            if group not in groups_data:
+                raise KeyError(
+                    f"Group '{group}' not found in normalization stats file. "
+                    f"Available groups: {list(groups_data.keys())}"
+                )
+            
+            group_stats = groups_data[group]
+            
+            # Load state normalization stats
+            state_stats = group_stats.get("state", {})
+            if "mean" not in state_stats or "std" not in state_stats:
+                raise ValueError(
+                    f"State normalization stats (mean/std) not found for group '{group}'"
+                )
+            state_mean = torch.tensor(
+                state_stats["mean"], dtype=torch.float32, device=self.device
+            )
+            state_std = torch.tensor(
+                state_stats["std"], dtype=torch.float32, device=self.device
+            )
+            # Ensure std is positive
+            state_std = torch.clamp(state_std, min=1e-6)
+            self._state_norm_mean[group] = state_mean
+            self._state_norm_std[group] = state_std
+            
+            # Load reward normalization stats
+            reward_stats = group_stats.get("reward", {})
+            if "mean" not in reward_stats or "std" not in reward_stats:
+                raise ValueError(
+                    f"Reward normalization stats (mean/std) not found for group '{group}'"
+                )
+            reward_mean = torch.tensor(
+                reward_stats["mean"], dtype=torch.float32, device=self.device
+            )
+            reward_std = torch.tensor(
+                reward_stats["std"], dtype=torch.float32, device=self.device
+            )
+            # Ensure std is positive
+            reward_std = torch.clamp(reward_std, min=1e-6)
+            self._reward_norm_mean[group] = reward_mean
+            self._reward_norm_std[group] = reward_std
+
+
     def _mbpo_init(
         self,
         *,
@@ -1026,9 +1276,11 @@ class _MbpoWorldModelMixin:
         # If set, it overrides the old "real_ratio fraction" mixing behavior in sampling.
         syn_ratio: Optional[float] = None,
         reward_loss_coef: float = 1.0,
+        logvar_loss_coef: float = 1.0,  # scaling coefficient for log-variance term in NLL loss
+        state_normalize: bool = False,
         reward_normalize: bool = False,
-        reward_norm_alpha: float = 0.01,
         reward_norm_eps: float = 1e-6,
+        normalization_stats_json: Optional[str] = None,
         separate_reward_net: bool = False,
         training_iterations: int = 0,
         centralized_dynamics: bool = False,
@@ -1037,6 +1289,21 @@ class _MbpoWorldModelMixin:
         min_log_var: float = -10.0,
         max_log_var: float = -2.0,
         warmup_steps: int = 0,
+        # Rollout uncertainty gating: if a threshold is provided, synthetic transitions with
+        # uncertainty above the threshold will be marked invalid and excluded from the
+        # synthetic replay buffer (and the rollout for that env will be terminated).
+        rollout_uncertainty_threshold: Optional[float] = None,
+        # Optionally provide per-group thresholds (overrides the scalar threshold when present).
+        # Example Hydra override: ++algorithm.rollout_uncertainty_thresholds.'agents'=0.25
+        rollout_uncertainty_thresholds: Optional[Dict[str, float]] = None,
+        # Which uncertainty metric to threshold on. Must be one of:
+        # 'epistemic_obs_var', 'epistemic_rew_std', 'aleatoric_obs_logvar', 'aleatoric_rew_logvar',
+        # 'total_obs_unc', 'total_rew_unc'
+        rollout_uncertainty_metric: str = "total_rew_unc",
+        # Use oracle (simulator) instead of world model for synthetic rollouts.
+        # When enabled, the environment is stepped directly to get ground truth next states and rewards.
+        # This is useful for sanity checking the MBPO algorithm without model errors.
+        use_oracle: bool = False,
         load_world_model_path: Optional[str] = None,
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
@@ -1078,9 +1345,22 @@ class _MbpoWorldModelMixin:
         self.model_hidden_size = model_hidden_size
         self.model_num_layers = model_num_layers
         self.reward_loss_coef = float(reward_loss_coef)
+        self.logvar_loss_coef = float(logvar_loss_coef)
+        self.state_normalize = bool(state_normalize)
         self.reward_normalize = bool(reward_normalize)
-        self.reward_norm_alpha = float(reward_norm_alpha)
         self.reward_norm_eps = float(reward_norm_eps)
+        # Normalize normalization_stats_json: handle string "null" from Hydra CLI
+        if normalization_stats_json is not None:
+            if isinstance(normalization_stats_json, str):
+                normalization_stats_json_normalized = normalization_stats_json.strip().lower()
+                if normalization_stats_json_normalized in ("null", "none", ""):
+                    normalization_stats_json = None
+        self.normalization_stats_json = normalization_stats_json
+        # Require normalization_stats_json if normalization is enabled
+        if (self.state_normalize or self.reward_normalize) and self.normalization_stats_json is None:
+            raise ValueError(
+                "normalization_stats_json must be provided when state_normalize or reward_normalize is True"
+            )
         self.separate_reward_net = bool(separate_reward_net)
         self.training_iterations = max(0, int(training_iterations))
         self.centralized_dynamics = centralized_dynamics
@@ -1089,6 +1369,14 @@ class _MbpoWorldModelMixin:
         self.min_log_var = min_log_var
         self.max_log_var = max_log_var
         self.warmup_steps = warmup_steps
+        self.rollout_uncertainty_threshold = (
+            None
+            if rollout_uncertainty_threshold is None
+            else float(rollout_uncertainty_threshold)
+        )
+        self.rollout_uncertainty_thresholds = rollout_uncertainty_thresholds
+        self.rollout_uncertainty_metric = str(rollout_uncertainty_metric)
+        self.use_oracle = bool(use_oracle)
         self.save_world_model_path = save_world_model_path
         self.save_world_model_interval = save_world_model_interval
         self.oracle_reward = bool(oracle_reward)
@@ -1105,95 +1393,121 @@ class _MbpoWorldModelMixin:
         self.world_model_debug_video_env_index = int(world_model_debug_video_env_index)
         self.world_model_debug_video_obs_xy_indices = world_model_debug_video_obs_xy_indices
         self.world_model_debug_video_mode = str(world_model_debug_video_mode)
+        # Normalize load_world_model_path: handle string "null" from Hydra CLI
+
+        if load_world_model_path is not None:
+            if isinstance(load_world_model_path, str):
+                load_world_model_path_normalized = load_world_model_path.strip().lower()
+                if load_world_model_path_normalized in ("null", "none", ""):
+                    load_world_model_path = None
         self._dynamics: Dict[str, List[_DynamicsModel]] = {}
         self._dyn_optimizers: Dict[str, List[torch.optim.Optimizer]] = {}
         self._model_losses: Dict[str, torch.Tensor] = {}
         self._train_steps: Dict[str, int] = {}
+        # Check if we should skip world model initialization entirely (e.g., threshold=0.0)
+        # This avoids creating world model infrastructure when it won't be used
+        skip_world_model_init = False
+        # Check global threshold first (per-group thresholds checked later in get_replay_buffer)
+        if self.rollout_uncertainty_threshold is not None and self.rollout_uncertainty_threshold == 0.0:
+            if not getattr(self, "use_oracle", False):
+                skip_world_model_init = True
+
+        # Initialize train_steps for all groups (needed even if world model is skipped)
+        for group in self.group_map.keys():
+            self._train_steps[group] = 0
+
         self._elite_indices: Dict[str, torch.Tensor] = {}
         self._dynamics_train_buffers: Dict[str, _DynamicsTrainBuffer] = {}
-        # Running reward normalization stats (per group). Stored on device.
-        self._reward_running_mean: Dict[str, torch.Tensor] = {}
-        self._reward_running_var: Dict[str, torch.Tensor] = {}
+        # Pre-computed normalization stats from JSON file (per group). Stored on device.
+        self._state_norm_mean: Dict[str, torch.Tensor] = {}
+        self._state_norm_std: Dict[str, torch.Tensor] = {}
+        self._reward_norm_mean: Dict[str, torch.Tensor] = {}
+        self._reward_norm_std: Dict[str, torch.Tensor] = {}
+        
+        # Load normalization stats from JSON file if normalization is enabled
+        if self.normalization_stats_json is not None and (self.state_normalize or self.reward_normalize):
+            self._load_normalization_stats()
+        # Only initialize world model infrastructure if we'll actually use it
+        if not skip_world_model_init:
+            for group in self.group_map.keys():
+                obs_shape = self.observation_spec[group, "observation"].shape
+                n_agents = obs_shape[0]
+                obs_dim = int(math.prod(obs_shape[1:]))
 
-        for group in self.group_map.keys():
-            obs_shape = self.observation_spec[group, "observation"].shape
-            n_agents = obs_shape[0]
-            obs_dim = int(math.prod(obs_shape[1:]))
-
-            action_space = self.action_spec[group, "action"]
-            if hasattr(action_space, "space"):
-                if hasattr(action_space.space, "n"):
-                    action_dim = action_space.space.n
+                action_space = self.action_spec[group, "action"]
+                if hasattr(action_space, "space"):
+                    if hasattr(action_space.space, "n"):
+                        action_dim = action_space.space.n
+                    else:
+                        action_dim = int(math.prod(action_space.shape[1:]))
                 else:
                     action_dim = int(math.prod(action_space.shape[1:]))
-            else:
-                action_dim = int(math.prod(action_space.shape[1:]))
 
-            # Per-agent vs centralized world model sizes
-            if self.centralized_dynamics:
-                dyn_input_dim = n_agents * (obs_dim + action_dim)
-                next_obs_dim_out = n_agents * obs_dim
-                reward_dim_out = n_agents  # per-agent reward (flattened)
-                done_dim_out = n_agents  # per-agent done logits (flattened)
-            else:
-                dyn_input_dim = obs_dim + action_dim
-                next_obs_dim_out = obs_dim
-                reward_dim_out = 1
-                done_dim_out = 1
+                # Per-agent vs centralized world model sizes
+                if self.centralized_dynamics:
+                    dyn_input_dim = n_agents * (obs_dim + action_dim)
+                    next_obs_dim_out = n_agents * obs_dim
+                    reward_dim_out = n_agents  # per-agent reward (flattened)
+                    done_dim_out = n_agents  # per-agent done logits (flattened)
+                else:
+                    dyn_input_dim = obs_dim + action_dim
+                    next_obs_dim_out = obs_dim
+                    reward_dim_out = 1
+                    done_dim_out = 1
 
-            models: List[_DynamicsModel] = []
-            opts: List[torch.optim.Optimizer] = []
-            for _ in range(self.ensemble_size):
-                model = _DynamicsModel(
-                    input_dim=dyn_input_dim,
-                    next_obs_dim=next_obs_dim_out,
-                    reward_dim=reward_dim_out,
-                    done_dim=done_dim_out,
-                    hidden_size=self.model_hidden_size,
-                    num_layers=self.model_num_layers,
-                    stochastic=self.stochastic_dynamics,
-                    min_log_var=self.min_log_var,
-                    max_log_var=self.max_log_var,
-                    separate_reward_net=getattr(self, "separate_reward_net", False),
-                ).to(self.device)
-                models.append(model)
-                opts.append(torch.optim.Adam(model.parameters(), lr=self.model_lr))
+                models: List[_DynamicsModel] = []
+                opts: List[torch.optim.Optimizer] = []
+                for _ in range(self.ensemble_size):
+                    model = _DynamicsModel(
+                        input_dim=dyn_input_dim,
+                        next_obs_dim=next_obs_dim_out,
+                        reward_dim=reward_dim_out,
+                        done_dim=done_dim_out,
+                        hidden_size=self.model_hidden_size,
+                        num_layers=self.model_num_layers,
+                        stochastic=self.stochastic_dynamics,
+                        min_log_var=self.min_log_var,
+                        max_log_var=self.max_log_var,
+                        separate_reward_net=getattr(self, "separate_reward_net", False),
+                    ).to(self.device)
+                    models.append(model)
+                    opts.append(torch.optim.Adam(model.parameters(), lr=self.model_lr))
 
-            self._dynamics[group] = models
-            self._dyn_optimizers[group] = opts
-            self._model_losses[group] = torch.zeros(
-                self.ensemble_size, device=self.device
-            )
-            self._train_steps[group] = 0
-            self._elite_indices[group] = torch.arange(
-                min(self.ensemble_size, self.n_elites or self.ensemble_size),
-                device=self.device,
-            )
+                self._dynamics[group] = models
+                self._dyn_optimizers[group] = opts
+                self._model_losses[group] = torch.zeros(
+                    self.ensemble_size, device=self.device
+                )
+                self._train_steps[group] = 0
+                self._elite_indices[group] = torch.arange(
+                    min(self.ensemble_size, self.n_elites or self.ensemble_size),
+                    device=self.device,
+                )
 
-            # Dedicated dynamics training buffer (keeps history across iterations).
-            # Size: a few iterations worth of on-policy data.
-            # We avoid exposing a new hyperparam for now; adjust multiplier if needed.
-            base_mem = int(self.experiment_config.replay_buffer_memory_size(self.on_policy))
-            dyn_mem = max(base_mem * 10, int(self.model_batch_size) * 10)
-            self._dynamics_train_buffers[group] = self._get_dynamics_training_buffer(
-                memory_size=dyn_mem
-            )
+                # Dedicated dynamics training buffer (keeps history across iterations).
+                # Size: a few iterations worth of on-policy data.
+                # We avoid exposing a new hyperparam for now; adjust multiplier if needed.
+                base_mem = int(self.experiment_config.replay_buffer_memory_size(self.on_policy))
+                dyn_mem = max(base_mem * 10, int(self.model_batch_size) * 10)
+                self._dynamics_train_buffers[group] = self._get_dynamics_training_buffer(
+                    memory_size=dyn_mem
+                )
 
-            # Initialize running reward stats (scalar) for optional normalization.
-            self._reward_running_mean[group] = torch.zeros((), device=self.device)
-            self._reward_running_var[group] = torch.ones((), device=self.device)
         
-        # Load pretrained world model if path is provided
-        if load_world_model_path is not None:
+        # Load pretrained world model if path is provided (only if we'll use it)
+
+        if load_world_model_path is not None and not skip_world_model_init:
             self.load_world_model(load_world_model_path, strict=load_world_model_strict)
         
         # Track last save step for interval-based saving
-        self._last_save_step: Dict[str, int] = {group: 0 for group in self.group_map.keys()}
+        self._last_save_step: Dict[str, int] = {g: 0 for g in self.group_map.keys()}
         # Use a dedicated RNG for world-model training so we don't perturb the policy/replay sampling RNG.
         # This is critical for on-policy algorithms: consuming global RNG here can change minibatch order.
-        seed = int(getattr(self.experiment, "seed", 0))
-        self._world_model_rng = torch.Generator(device="cpu")
-        self._world_model_rng.manual_seed(seed + 10_000_019)
+        # Only create RNG if we'll use the world model
+        if not skip_world_model_init:
+            seed = int(getattr(self.experiment, "seed", 0))
+            self._world_model_rng = torch.Generator(device="cpu")
+            self._world_model_rng.manual_seed(seed + 10_000_019)
 
     def _current_rollout_horizon(self, group: str) -> int:
         """Current synthetic rollout horizon.
@@ -1229,14 +1543,30 @@ class _MbpoWorldModelMixin:
         return max(1, h)
 
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
+        # Check if we should skip world model operations entirely (e.g., threshold=0.0)
+        # Do this first to avoid any world model overhead
+        skip_world_model = False
+        unc_threshold = self._get_rollout_uncertainty_threshold(group)
+        if unc_threshold is not None and unc_threshold == 0.0:
+            # With threshold=0.0, only samples with exactly 0 uncertainty will pass
+            # This is extremely rare, so we skip world model operations to match baseline
+            if not getattr(self, "use_oracle", False):
+                skip_world_model = True
+        
         # Ensure the synthetic buffer exists (created via get_replay_buffer()).
         # We don't create buffers here to avoid touching Experiment setup logic.
-        synth_buf = getattr(self, "_synthetic_replay_buffers", {}).get(group, None)
-        if synth_buf is not None and hasattr(synth_buf, "empty"):
-            # Synthetic rollouts are per-iteration; clear at the start of the step.
-            synth_buf.empty()
-
+        # Skip if world model is disabled to avoid any overhead
+        if not skip_world_model:
+            synth_buf = getattr(self, "_synthetic_replay_buffers", {}).get(group, None)
+            if synth_buf is not None and hasattr(synth_buf, "empty"):
+                # Synthetic rollouts are per-iteration; clear at the start of the step.
+                synth_buf.empty()
         batch = super().process_batch(group, batch)
+        
+        # Skip all world model operations if disabled
+        if skip_world_model:
+            return batch
+        
         flat_batch = batch.reshape(-1) if not self.has_rnn else batch
 
         # Store transitions for dynamics training (do not clear between iterations).
@@ -1249,7 +1579,8 @@ class _MbpoWorldModelMixin:
                 pass
 
         self._train_steps[group] += 1
-        if self._train_steps[group] % self.model_train_freq == 0:
+        
+        if self._train_steps[group] % self.model_train_freq == 0 and not skip_world_model:
             # Train the dynamics model for multiple iterations, sampling a fresh minibatch each time.
             dyn_buf = getattr(self, "_dynamics_train_buffers", {}).get(group, None)
             for _ in range(int(getattr(self, "training_iterations", 0))):
@@ -1272,37 +1603,6 @@ class _MbpoWorldModelMixin:
             except Exception:
                 pass
 
-            if self._train_steps[group] > self.warmup_steps:
-                synthetic = self._generate_model_rollouts(group, flat_batch)
-                if synthetic is not None and synthetic.numel() > 0:
-                    # Optional lightweight debug: log how many synthetic transitions were generated
-                    # (helps confirm synthetic generation is actually happening).
-                    try:
-                        if hasattr(self.experiment, "logger") and self.experiment.logger is not None:
-                            step = getattr(self.experiment, "total_frames", self._train_steps[group])
-                            self.experiment.logger.log(
-                                {
-                                    f"world_model/{group}/synthetic/num_transitions": float(
-                                        int(synthetic.numel())
-                                    )
-                                },
-                                step=step,
-                            )
-                    except Exception:
-                        pass
-                    synthetic = super().process_batch(group, synthetic)
-                    if not self.has_rnn:
-                        synthetic = synthetic.reshape(-1)
-                        # Store synthetic rollouts in the dedicated buffer.
-                        synth_buf = getattr(self, "_synthetic_replay_buffers", {}).get(
-                            group, None
-                        )
-                        if synth_buf is not None:
-                            synth_buf.extend(synthetic.to(synth_buf.storage.device))
-                    else:
-                        # RNN batches have sequence structure; mixing is not supported yet.
-                        pass
-            
             # Auto-save world model if path is specified and interval condition is met
             # Save once per training step (check all groups, use minimum step)
             if self.save_world_model_path is not None:
@@ -1323,6 +1623,64 @@ class _MbpoWorldModelMixin:
                     # Update all groups' last save step
                     for g in self._last_save_step.keys():
                         self._last_save_step[g] = self._train_steps[g]
+
+        if self._train_steps[group] > self.warmup_steps and not skip_world_model:
+            synthetic = self._generate_model_rollouts(group, flat_batch)
+            if synthetic is not None and synthetic.numel() > 0:
+                # Optional lightweight debug: log how many synthetic transitions were generated
+                # (helps confirm synthetic generation is actually happening).
+                try:
+                    if hasattr(self.experiment, "logger") and self.experiment.logger is not None:
+                        step = getattr(self.experiment, "total_frames", self._train_steps[group])
+                        self.experiment.logger.log(
+                            {
+                                f"world_model/{group}/synthetic/num_transitions": float(
+                                    int(synthetic.numel())
+                                )
+                            },
+                            step=step,
+                        )
+                except Exception:
+                    pass
+                synthetic = super().process_batch(group, synthetic)
+                use_synth = False
+                if not self.has_rnn:
+                    synthetic = synthetic.reshape(-1)
+                    # Drop invalid synthetic transitions (e.g., high-uncertainty rollouts).
+                    try:
+                        if "synthetic_valid" in synthetic.keys(True, True):
+                            v = synthetic.get("synthetic_valid").to(torch.bool).reshape(-1)
+                            use_synth = v.any()
+                            n_before = int(v.numel())
+                            n_keep = int(v.sum().item())
+                            n_drop = int(n_before - n_keep)
+                            if n_drop > 0:
+                                synthetic = synthetic[v]
+                                try:
+                                    if hasattr(self.experiment, "logger") and self.experiment.logger is not None:
+                                        step = getattr(self.experiment, "total_frames", self._train_steps[group])
+                                        self.experiment.logger.log(
+                                            {
+                                                f"world_model/{group}/synthetic/dropped_transitions": float(n_drop),
+                                                f"world_model/{group}/synthetic/kept_transitions": float(n_keep),
+                                            },
+                                            step=step,
+                                        )
+                                except Exception:
+                                    pass
+                        else:
+                            use_synth = True
+                    except Exception:
+                        pass
+                    # Store synthetic rollouts in the dedicated buffer.
+                    synth_buf = getattr(self, "_synthetic_replay_buffers", {}).get(
+                        group, None
+                    )
+                    if synth_buf is not None and use_synth:
+                        synth_buf.extend(synthetic.to(synth_buf.storage.device))
+                else:
+                    # RNN batches have sequence structure; mixing is not supported yet.
+                    pass
 
         return batch
 
@@ -1426,21 +1784,42 @@ class _MbpoWorldModelMixin:
         total_loss_done = 0.0
         total_mse_obs = 0.0
         total_mse_rew = 0.0
+        total_smape_obs = 0.0
+        total_smape_rew = 0.0
         total_r2_rew = 0.0
         total_r2_obs = 0.0
 
-        # Reward normalization uses running mean/var if enabled (but we don't update them here).
-        use_rn = bool(getattr(self, "reward_normalize", False))
-        if use_rn:
+        # Normalize observations/states if enabled
+        if getattr(self, "state_normalize", False) and group in self._state_norm_mean:
+            obs_mean = self._state_norm_mean[group]
+            obs_std = self._state_norm_std[group]
             eps = float(getattr(self, "reward_norm_eps", 1e-6))
-            r_mean = self._reward_running_mean[group]
-            r_std = torch.sqrt(self._reward_running_var[group].clamp_min(0.0)) + eps
+            # Normalize observations and next observations
+            # obs_mean and obs_std should have shape [obs_dim] for per-agent or [n_agents*obs_dim] for centralized
+            # obs_flat has shape [B*n_agents, obs_dim] for per-agent or [B, n_agents*obs_dim] for centralized
+            # Ensure the last dimension matches exactly
+            if obs_flat.shape[-1] != obs_mean.shape[-1]:
+                raise ValueError(
+                    f"Observation dimension mismatch for group '{group}': "
+                    f"obs_flat.shape[-1]={obs_flat.shape[-1]}, "
+                    f"norm_mean.shape[-1]={obs_mean.shape[-1]}"
+                )
+            obs_flat = (obs_flat - obs_mean) / (obs_std + eps)
+            next_obs_flat = (next_obs_flat - obs_mean) / (obs_std + eps)
+        
+        # Reward normalization uses pre-loaded stats if enabled
+        use_rn = bool(getattr(self, "reward_normalize", False))
+        if use_rn and group in self._reward_norm_mean:
+            eps = float(getattr(self, "reward_norm_eps", 1e-6))
+            r_mean = self._reward_norm_mean[group]
+            r_std = self._reward_norm_std[group] + eps
 
+        logvar_coef = float(getattr(self, "logvar_loss_coef", 1.0))
         for model in self._dynamics[group]:
             mu_next, lv_delta, mu_rew, lv_rew, done_logit = model(obs_flat, action_flat)
             inv_var_obs = torch.exp(-lv_delta)
             inv_var_rew = torch.exp(-lv_rew)
-            loss_obs = torch.mean((mu_next - next_obs_flat) ** 2 * inv_var_obs + lv_delta)
+            loss_obs = torch.mean((mu_next - next_obs_flat) ** 2 * inv_var_obs + logvar_coef * lv_delta)
 
             # R^2 diagnostics (scale-free): compare to predicting the batch mean.
             # These are computed on raw (non-normalized) targets.
@@ -1456,14 +1835,41 @@ class _MbpoWorldModelMixin:
             var_obs = torch.mean((obs_target - obs_target.mean()) ** 2)
             r2_obs = 1.0 - (mse_obs / (var_obs + 1e-12))
 
+            # Symmetric MAPE (sMAPE): 200 * |pred-actual| / (|pred| + |actual| + eps), bounded in [0, 200].
+            smape_eps = 1e-6
+            smape_rew = (
+                200.0
+                * (rew_pred - rew_target).abs()
+                / (rew_pred.abs() + rew_target.abs() + smape_eps)
+            )
+            smape_obs = (
+                200.0
+                * (obs_pred - obs_target).abs()
+                / (obs_pred.abs() + obs_target.abs() + smape_eps)
+            )
+
             if use_rn:
-                r_n = (reward_flat - r_mean) / r_std
-                mu_rew_n = (mu_rew - r_mean) / r_std
+                # Handle shape: reward stats may be per-agent or scalar
+                if r_mean.dim() == 0:
+                    # Scalar: broadcast to match reward shape
+                    r_n = (reward_flat - r_mean) / r_std
+                    mu_rew_n = (mu_rew - r_mean) / r_std
+                else:
+                    # Per-agent: ensure shapes match
+                    if reward_flat.shape[-1] != r_mean.shape[-1]:
+                        raise ValueError(
+                            f"Reward dimension mismatch for group '{group}': "
+                            f"reward_flat.shape[-1]={reward_flat.shape[-1]}, "
+                            f"norm_mean.shape[-1]={r_mean.shape[-1]}"
+                        )
+                    r_n = (reward_flat - r_mean) / r_std
+                    mu_rew_n = (mu_rew - r_mean) / r_std
                 lv_rew_n = lv_rew - 2.0 * torch.log(r_std)
                 inv_var_rew_n = torch.exp(-lv_rew_n)
-                loss_rew = torch.mean((mu_rew_n - r_n) ** 2 * inv_var_rew_n + lv_rew_n)
+                loss_rew = torch.mean((mu_rew_n - r_n) ** 2 * inv_var_rew_n + logvar_coef * lv_rew_n)
             else:
-                loss_rew = torch.mean((mu_rew - reward_flat) ** 2 * inv_var_rew + lv_rew)
+                loss_rew = torch.mean((mu_rew - reward_flat) ** 2 * inv_var_rew + logvar_coef * lv_rew)
+            loss_rew = loss_rew * float(getattr(self, "reward_loss_coef", 1.0))
             loss_rew = loss_rew * float(getattr(self, "reward_loss_coef", 1.0))
             loss_done = F.binary_cross_entropy_with_logits(done_logit, done_flat.float())
             loss = loss_obs + loss_rew + loss_done
@@ -1474,6 +1880,8 @@ class _MbpoWorldModelMixin:
             total_loss_done += float(loss_done.detach().cpu().item())
             total_mse_obs += float(mse_obs.detach().cpu().item())
             total_mse_rew += float(mse_rew.detach().cpu().item())
+            total_smape_obs += float(smape_obs.mean().detach().cpu().item())
+            total_smape_rew += float(smape_rew.mean().detach().cpu().item())
             total_r2_obs += float(r2_obs.detach().cpu().item())
             total_r2_rew += float(r2_rew.detach().cpu().item())
 
@@ -1485,6 +1893,8 @@ class _MbpoWorldModelMixin:
             "eval/loss_done": total_loss_done / denom,
             "eval/mse_observation": total_mse_obs / denom,
             "eval/mse_reward": total_mse_rew / denom,
+            "eval/smape_observation": total_smape_obs / denom,
+            "eval/smape_reward": total_smape_rew / denom,
             "eval/r2_observation": total_r2_obs / denom,
             "eval/r2_reward": total_r2_rew / denom,
             "eval/loss_total": float(losses_t.mean().detach().cpu().item()),
@@ -1498,6 +1908,90 @@ class _MbpoWorldModelMixin:
         # Ensure on device
         l = losses_per_model.to(self.device)
         self._elite_indices[group] = torch.argsort(l)[:n_elites]
+
+    def _compute_per_sample_uncertainty(
+        self, group: str, flat_batch: TensorDictBase
+    ) -> Dict[str, torch.Tensor]:
+        """Compute per-sample uncertainty values for validation threshold computation.
+        
+        Returns:
+            Dictionary with per-sample uncertainty tensors:
+            - 'epistemic_obs_var': [n_samples] - variance of ensemble means for observations
+            - 'epistemic_rew_std': [n_samples] - std of ensemble means for rewards
+            - 'aleatoric_obs_logvar': [n_samples] - mean predicted log-variance for observations
+            - 'aleatoric_rew_logvar': [n_samples] - mean predicted log-variance for rewards
+            - 'total_obs_unc': [n_samples] - combined uncertainty (epistemic + aleatoric) for obs
+            - 'total_rew_unc': [n_samples] - combined uncertainty (epistemic + aleatoric) for rewards
+        """
+        keys = flat_batch.keys(True, True)
+        if (group, "observation") not in keys:
+            return {}
+        
+        obs = flat_batch.get((group, "observation")).to(self.device)
+        action = flat_batch.get((group, "action")).to(self.device)
+        
+        obs = obs.reshape(-1, obs.shape[-2], obs.shape[-1])
+        action = action.reshape(-1, action.shape[-2], *action.shape[-1:])
+        action = self._encode_action(group, action)
+        
+        if self.centralized_dynamics:
+            obs_flat = obs.reshape(obs.shape[0], -1)
+            action_flat = action.reshape(action.shape[0], -1)
+        else:
+            obs_flat = obs.flatten(0, 1)
+            action_flat = action.flatten(0, 1)
+        
+        with torch.no_grad():
+            mu_next_all = []
+            mu_rew_all = []
+            lv_delta_all = []
+            lv_rew_all = []
+            for model in self._dynamics[group]:
+                mu_next, lv_delta, mu_rew, lv_rew, _ = model(obs_flat, action_flat)
+                mu_next_all.append(mu_next)
+                mu_rew_all.append(mu_rew)
+                lv_delta_all.append(lv_delta)
+                lv_rew_all.append(lv_rew)
+            
+            mu_next_all = torch.stack(mu_next_all, dim=0)  # [ensemble_size, n_samples, obs_dim]
+            mu_rew_all = torch.stack(mu_rew_all, dim=0)  # [ensemble_size, n_samples, rew_dim]
+            lv_delta_all = torch.stack(lv_delta_all, dim=0)  # [ensemble_size, n_samples, obs_dim]
+            lv_rew_all = torch.stack(lv_rew_all, dim=0)  # [ensemble_size, n_samples, rew_dim]
+            
+            # Epistemic uncertainty: variance/std of ensemble means per sample
+            epistemic_obs_var = torch.var(mu_next_all, dim=0)  # [n_samples, obs_dim]
+            epistemic_obs_var = torch.mean(epistemic_obs_var, dim=-1)  # [n_samples] - mean across obs dims
+            
+            epistemic_rew_std = torch.std(mu_rew_all, dim=0)  # [n_samples, rew_dim]
+            epistemic_rew_std = torch.mean(epistemic_rew_std, dim=-1)  # [n_samples] - mean across rew dims
+            
+            # Aleatoric uncertainty: mean predicted log-variance per sample
+            aleatoric_obs_logvar = torch.mean(lv_delta_all, dim=0)  # [n_samples, obs_dim]
+            aleatoric_obs_logvar = torch.mean(aleatoric_obs_logvar, dim=-1)  # [n_samples]
+            
+            aleatoric_rew_logvar = torch.mean(lv_rew_all, dim=0)  # [n_samples, rew_dim]
+            aleatoric_rew_logvar = torch.mean(aleatoric_rew_logvar, dim=-1)  # [n_samples]
+            
+            # Combined uncertainty: epistemic + aleatoric
+            # For aleatoric, convert log-var to std: std = exp(0.5 * log_var)
+            aleatoric_obs_std = torch.exp(0.5 * aleatoric_obs_logvar)
+            aleatoric_rew_std = torch.exp(0.5 * aleatoric_rew_logvar)
+            
+            # Total uncertainty: sqrt(epistemic_var + aleatoric_var) = sqrt(epistemic_var) + aleatoric_std (approximation)
+            # Or more accurately: total_var = epistemic_var + aleatoric_var, total_std = sqrt(total_var)
+            epistemic_obs_std = torch.sqrt(epistemic_obs_var.clamp_min(0.0))
+            total_obs_unc = torch.sqrt(epistemic_obs_var + aleatoric_obs_std.pow(2).clamp_min(0.0))
+            
+            total_rew_unc = torch.sqrt(epistemic_rew_std.pow(2) + aleatoric_rew_std.pow(2).clamp_min(0.0))
+            
+            return {
+                "epistemic_obs_var": epistemic_obs_var.detach().cpu(),
+                "epistemic_rew_std": epistemic_rew_std.detach().cpu(),
+                "aleatoric_obs_logvar": aleatoric_obs_logvar.detach().cpu(),
+                "aleatoric_rew_logvar": aleatoric_rew_logvar.detach().cpu(),
+                "total_obs_unc": total_obs_unc.detach().cpu(),
+                "total_rew_unc": total_rew_unc.detach().cpu(),
+            }
 
     def _train_dynamics(self, group: str, flat_batch: TensorDictBase) -> None:
         keys = flat_batch.keys(True, True)
@@ -1536,18 +2030,23 @@ class _MbpoWorldModelMixin:
             reward_flat = reward.flatten(0, 1)
             done_flat = done.flatten(0, 1)
 
-        # Optional: update running reward mean/var on the full (non-bootstrapped) batch.
-        # This is used to scale the reward loss so small-magnitude rewards don't get ignored.
-        if getattr(self, "reward_normalize", False):
-            with torch.no_grad():
-                r_all = reward_flat.detach().to(torch.float32).flatten()
-                if r_all.numel() > 0:
-                    batch_mean = r_all.mean()
-                    batch_var = r_all.var(unbiased=False)
-                    alpha = float(getattr(self, "reward_norm_alpha", 0.01))
-                    alpha = min(max(alpha, 0.0), 1.0)
-                    self._reward_running_mean[group].lerp_(batch_mean, alpha)
-                    self._reward_running_var[group].lerp_(batch_var, alpha)
+        # Normalize observations/states if enabled
+        if getattr(self, "state_normalize", False) and group in self._state_norm_mean:
+            obs_mean = self._state_norm_mean[group]
+            obs_std = self._state_norm_std[group]
+            eps = float(getattr(self, "reward_norm_eps", 1e-6))
+            # Normalize observations and next observations
+            # obs_mean and obs_std should have shape [obs_dim] for per-agent or [n_agents*obs_dim] for centralized
+            # obs_flat has shape [B*n_agents, obs_dim] for per-agent or [B, n_agents*obs_dim] for centralized
+            # Ensure the last dimension matches exactly
+            if obs_flat.shape[-1] != obs_mean.shape[-1]:
+                raise ValueError(
+                    f"Observation dimension mismatch for group '{group}': "
+                    f"obs_flat.shape[-1]={obs_flat.shape[-1]}, "
+                    f"norm_mean.shape[-1]={obs_mean.shape[-1]}"
+                )
+            obs_flat = (obs_flat - obs_mean) / (obs_std + eps)
+            next_obs_flat = (next_obs_flat - obs_mean) / (obs_std + eps)
 
         # Bootstrap sampling per model encourages ensemble diversity.
         n_samples = obs_flat.shape[0]
@@ -1582,29 +2081,43 @@ class _MbpoWorldModelMixin:
 
             mu_next, lv_delta, mu_rew, lv_rew, done_logit = model(o, a)
 
-            # Gaussian NLL-style losses (per-dim): (x-mu)^2 * exp(-log_var) + log_var
+            # Gaussian NLL-style losses (per-dim): (x-mu)^2 * exp(-log_var) + logvar_loss_coef * log_var
+            # Scaling the log_var term prevents the model from exploiting high uncertainty to make loss negative
             inv_var_obs = torch.exp(-lv_delta)
             inv_var_rew = torch.exp(-lv_rew)
-            loss_obs = torch.mean((mu_next - no) ** 2 * inv_var_obs + lv_delta)
+            logvar_coef = float(getattr(self, "logvar_loss_coef", 1.0))
+            loss_obs = torch.mean((mu_next - no) ** 2 * inv_var_obs + logvar_coef * lv_delta)
 
             # Reward loss scaling / normalization:
             # When rewards have small magnitude, unweighted MSE/NLL often collapses toward ~0.
-            # If enabled, we compute the reward loss in *normalized* space using running mean/std.
-            # This uses both running mean and variance, making gradients invariant to reward offset/scale.
-            if getattr(self, "reward_normalize", False):
+            # If enabled, we compute the reward loss in *normalized* space using pre-loaded mean/std.
+            # This uses both mean and variance, making gradients invariant to reward offset/scale.
+            if getattr(self, "reward_normalize", False) and group in self._reward_norm_mean:
                 eps = float(getattr(self, "reward_norm_eps", 1e-6))
-                r_mean = self._reward_running_mean[group]
-                r_std = torch.sqrt(self._reward_running_var[group].clamp_min(0.0)) + eps
+                r_mean = self._reward_norm_mean[group]
+                r_std = self._reward_norm_std[group] + eps
                 # Normalize targets and predictions.
-                r_n = (r - r_mean) / r_std
-                mu_rew_n = (mu_rew - r_mean) / r_std
+                # Handle shape: reward stats may be per-agent or scalar
+                if r_mean.dim() == 0:
+                    # Scalar: broadcast to match reward shape
+                    r_n = (r - r_mean) / r_std
+                    mu_rew_n = (mu_rew - r_mean) / r_std
+                else:
+                    # Per-agent: ensure shapes match
+                    if r.shape[-1] != r_mean.shape[-1]:
+                        raise ValueError(
+                            f"Reward dimension mismatch for group '{group}': "
+                            f"r.shape[-1]={r.shape[-1]}, norm_mean.shape[-1]={r_mean.shape[-1]}"
+                        )
+                    r_n = (r - r_mean) / r_std
+                    mu_rew_n = (mu_rew - r_mean) / r_std
                 # If stochastic (log-variance provided), convert to normalized-space log-variance:
                 # var_n = var / std^2  => log_var_n = log_var - 2*log(std)
                 lv_rew_n = lv_rew - 2.0 * torch.log(r_std)
                 inv_var_rew_n = torch.exp(-lv_rew_n)
-                loss_rew = torch.mean((mu_rew_n - r_n) ** 2 * inv_var_rew_n + lv_rew_n)
+                loss_rew = torch.mean((mu_rew_n - r_n) ** 2 * inv_var_rew_n + logvar_coef * lv_rew_n)
             else:
-                loss_rew = torch.mean((mu_rew - r) ** 2 * inv_var_rew + lv_rew)
+                loss_rew = torch.mean((mu_rew - r) ** 2 * inv_var_rew + logvar_coef * lv_rew)
             if self._oracle_reward_enabled() and bool(
                 getattr(self, "oracle_reward_disable_reward_head_loss", True)
             ):
@@ -1740,18 +2253,13 @@ class _MbpoWorldModelMixin:
                 abs_error.mean() / (reward_flat_for_bias.abs().mean() + nmae_eps) * 100.0
             ).detach().item()
 
-            # Expose current running reward mean/std when normalization is enabled (helps debugging).
-            if getattr(self, "reward_normalize", False):
-                running_reward_mean = float(self._reward_running_mean[group].detach().cpu().item())
-                running_reward_std = float(
-                    torch.sqrt(self._reward_running_var[group].clamp_min(0.0))
-                    .detach()
-                    .cpu()
-                    .item()
-                )
+            # Expose current reward normalization stats when enabled (helps debugging).
+            if getattr(self, "reward_normalize", False) and group in self._reward_norm_mean:
+                reward_norm_mean = self._reward_norm_mean[group].detach().cpu()
+                reward_norm_std = self._reward_norm_std[group].detach().cpu()
             else:
-                running_reward_mean = 0.0
-                running_reward_std = 0.0
+                reward_norm_mean = 0.0
+                reward_norm_std = 0.0
             
             # Compute range metrics: mean ± std (averaged across samples)
             pred_reward_min = (mean_pred_flat - std_pred_flat).mean().detach().item()
@@ -1851,8 +2359,9 @@ class _MbpoWorldModelMixin:
                 f"world_model/{group}/percentage_error/reward_smape": mean_smape,
                 f"world_model/{group}/percentage_error/reward_nmae": mean_nmae_percent,
                 f"world_model/{group}/reward_normalize/enabled": float(getattr(self, "reward_normalize", False)),
-                f"world_model/{group}/reward_normalize/running_mean": running_reward_mean,
-                f"world_model/{group}/reward_normalize/running_std": running_reward_std,
+                f"world_model/{group}/state_normalize/enabled": float(getattr(self, "state_normalize", False)),
+                f"world_model/{group}/reward_normalize/norm_mean": reward_norm_mean,
+                f"world_model/{group}/reward_normalize/norm_std": reward_norm_std,
                 f"world_model/{group}/reward_normalize/reward_loss_coef": float(getattr(self, "reward_loss_coef", 1.0)),
                 f"world_model/{group}/bias/reward_range_min": pred_reward_min,
                 f"world_model/{group}/bias/reward_range_max": pred_reward_max,
@@ -1953,6 +2462,317 @@ class _MbpoWorldModelMixin:
 
         return next_obs, reward, done_logit
 
+    def _predict_next_for_vis(
+        self, group: str, obs: torch.Tensor, action: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict next transition using MEAN predictions (no stochastic sampling).
+        
+        This is used for visualization to show model accuracy without sampling noise.
+        For actual rollouts, use `_predict_next` which includes stochastic sampling.
+        """
+        encoded_action = self._encode_action(group, action)
+        if self.centralized_dynamics:
+            obs_flat = obs.reshape(obs.shape[0], -1)
+            act_flat = encoded_action.reshape(encoded_action.shape[0], -1)
+        else:
+            obs_flat = obs.flatten(0, 1)
+            act_flat = encoded_action.flatten(0, 1)
+
+        elites = self._elite_indices.get(group, None)
+        if elites is None or elites.numel() == 0:
+            elites = torch.arange(self.ensemble_size, device=self.device)
+
+        # Get predictions from all elite models
+        mu_next_list = []
+        mu_rew_list = []
+        done_logit_list = []
+        for i in elites.tolist():
+            mu_next, _, mu_rew, _, done_logit = self._dynamics[group][i](
+                obs_flat, act_flat
+            )
+            mu_next_list.append(mu_next)
+            mu_rew_list.append(mu_rew)
+            done_logit_list.append(done_logit)
+
+        mu_next_s = torch.stack(mu_next_list, dim=0)  # [E, N, obs_dim]
+        mu_rew_s = torch.stack(mu_rew_list, dim=0)  # [E, N, rew_dim]
+        done_logit_s = torch.stack(done_logit_list, dim=0)  # [E, N, 1]
+
+        # Use ensemble MEAN (not sampling) for visualization
+        next_obs_flat = mu_next_s.mean(dim=0)  # [N, obs_dim]
+        reward_flat = mu_rew_s.mean(dim=0)  # [N, rew_dim]
+        done_logit = done_logit_s.mean(dim=0)  # [N, 1]
+
+        if self.centralized_dynamics:
+            next_obs = next_obs_flat.reshape(obs.shape)
+            reward = reward_flat.reshape(*obs.shape[:-1], 1)
+            done_logit = done_logit.reshape(*obs.shape[:-1], 1)
+        else:
+            next_obs = next_obs_flat.reshape(obs.shape)
+            reward = reward_flat.reshape(*obs.shape[:-1], 1)
+            done_logit = done_logit.reshape(*obs.shape[:-1], 1)
+
+        return next_obs, reward, done_logit
+
+    def _get_rollout_uncertainty_threshold(self, group: str) -> Optional[float]:
+        """Return the active uncertainty threshold for this group (if any)."""
+        ths = getattr(self, "rollout_uncertainty_thresholds", None)
+        if isinstance(ths, dict) and group in ths and ths[group] is not None:
+            try:
+                return float(ths[group])
+            except Exception:
+                pass
+        th = getattr(self, "rollout_uncertainty_threshold", None)
+        if th is None:
+            return None
+        try:
+            return float(th)
+        except Exception:
+            return None
+
+    @torch.no_grad()
+    def _predict_next_with_uncertainty(
+        self, group: str, obs: torch.Tensor, action: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Predict next transition and compute per-env uncertainty metrics.
+
+        Returns:
+            next_obs, reward, done_logit (same semantics as `_predict_next`)
+            unc: dict of per-env tensors with shape [B]
+        """
+        encoded_action = self._encode_action(group, action)
+        if self.centralized_dynamics:
+            obs_flat = obs.reshape(obs.shape[0], -1)
+            act_flat = encoded_action.reshape(encoded_action.shape[0], -1)
+            B = int(obs.shape[0])
+            n_agents = int(obs.shape[-2])
+        else:
+            # Flatten agent dimension: [B, n_agents, ...] -> [B*n_agents, ...]
+            B = int(obs.shape[0])
+            n_agents = int(obs.shape[-2])
+            obs_flat = obs.flatten(0, 1)
+            act_flat = encoded_action.flatten(0, 1)
+
+        elites = self._elite_indices.get(group, None)
+        if elites is None or elites.numel() == 0:
+            elites = torch.arange(self.ensemble_size, device=self.device)
+
+        mu_next_list = []
+        lv_delta_list = []
+        mu_rew_list = []
+        lv_rew_list = []
+        done_logit_list = []
+        for i in elites.tolist():
+            mu_next, lv_delta, mu_rew, lv_rew, done_logit = self._dynamics[group][i](
+                obs_flat, act_flat
+            )
+            mu_next_list.append(mu_next)
+            lv_delta_list.append(lv_delta)
+            mu_rew_list.append(mu_rew)
+            lv_rew_list.append(lv_rew)
+            done_logit_list.append(done_logit)
+
+        mu_next_s = torch.stack(mu_next_list, dim=0)  # [E, N, obs_dim]
+        lv_delta_s = torch.stack(lv_delta_list, dim=0)  # [E, N, obs_dim]
+        mu_rew_s = torch.stack(mu_rew_list, dim=0)  # [E, N, rew_dim]
+        lv_rew_s = torch.stack(lv_rew_list, dim=0)  # [E, N, rew_dim]
+        done_logit_s = torch.stack(done_logit_list, dim=0)  # [E, N, 1]
+
+        n_elites = int(mu_next_s.shape[0])
+        N = int(mu_next_s.shape[1])
+        model_idx = torch.randint(0, n_elites, (N,), device=mu_next_s.device)
+        batch_idx = torch.arange(N, device=mu_next_s.device)
+
+        # Sample (aleatoric uncertainty)
+        if self.stochastic_dynamics:
+            std_next_s = torch.exp(0.5 * lv_delta_s)
+            std_rew_s = torch.exp(0.5 * lv_rew_s)
+            next_obs_flat_s = torch.normal(mu_next_s, std_next_s)
+            reward_flat_s = torch.normal(mu_rew_s, std_rew_s)
+        else:
+            next_obs_flat_s = mu_next_s
+            reward_flat_s = mu_rew_s
+
+        next_obs_flat = next_obs_flat_s[model_idx, batch_idx]
+        reward_flat = reward_flat_s[model_idx, batch_idx]
+        done_logit = done_logit_s[model_idx, batch_idx]
+
+        # --- Uncertainty metrics (computed across ensemble) ---
+        epistemic_obs_var = torch.var(mu_next_s, dim=0).mean(dim=-1)  # [N]
+        epistemic_rew_std = torch.std(mu_rew_s, dim=0).mean(dim=-1)  # [N]
+        aleatoric_obs_logvar = lv_delta_s.mean(dim=0).mean(dim=-1)  # [N]
+        aleatoric_rew_logvar = lv_rew_s.mean(dim=0).mean(dim=-1)  # [N]
+
+        aleatoric_obs_std = torch.exp(0.5 * aleatoric_obs_logvar)
+        aleatoric_rew_std = torch.exp(0.5 * aleatoric_rew_logvar)
+
+        epistemic_obs_std = torch.sqrt(epistemic_obs_var.clamp_min(0.0))
+        total_obs_unc = torch.sqrt(
+            epistemic_obs_var + aleatoric_obs_std.pow(2).clamp_min(0.0)
+        )
+        total_rew_unc = torch.sqrt(
+            epistemic_rew_std.pow(2) + aleatoric_rew_std.pow(2).clamp_min(0.0)
+        )
+
+        if self.centralized_dynamics:
+            # Already per-env: [B]
+            unc = {
+                "epistemic_obs_var": epistemic_obs_var,
+                "epistemic_rew_std": epistemic_rew_std,
+                "aleatoric_obs_logvar": aleatoric_obs_logvar,
+                "aleatoric_rew_logvar": aleatoric_rew_logvar,
+                "total_obs_unc": total_obs_unc,
+                "total_rew_unc": total_rew_unc,
+            }
+        else:
+            # Aggregate per-agent values to per-env values: reshape [B*n_agents] -> [B, n_agents]
+            def _per_env(x: torch.Tensor) -> torch.Tensor:
+                return x.reshape(B, n_agents).mean(dim=-1)
+
+            unc = {
+                "epistemic_obs_var": _per_env(epistemic_obs_var),
+                "epistemic_rew_std": _per_env(epistemic_rew_std),
+                "aleatoric_obs_logvar": _per_env(aleatoric_obs_logvar),
+                "aleatoric_rew_logvar": _per_env(aleatoric_rew_logvar),
+                "total_obs_unc": _per_env(total_obs_unc),
+                "total_rew_unc": _per_env(total_rew_unc),
+            }
+
+        # Reshape sampled outputs back to original shapes
+        if self.centralized_dynamics:
+            next_obs = next_obs_flat.reshape(obs.shape)
+            reward = reward_flat.reshape(*obs.shape[:-1], 1)
+            done_logit = done_logit.reshape(*obs.shape[:-1], 1)
+        else:
+            next_obs = next_obs_flat.reshape(obs.shape)
+            reward = reward_flat.reshape(*obs.shape[:-1], 1)
+            done_logit = done_logit.reshape(*obs.shape[:-1], 1)
+
+        return next_obs, reward, done_logit, unc
+
+    def _step_oracle_env(
+        self, group: str, obs: torch.Tensor, action: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Step the environment (oracle) to get ground truth next observation, reward, and done.
+        
+        This bypasses the world model and uses the actual simulator/environment.
+        Useful for sanity checking the MBPO algorithm.
+        
+        Args:
+            group: Agent group name
+            obs: Current observation tensor [B, n_agents, obs_dim] or [B, obs_dim] for centralized
+            action: Action tensor [B, n_agents, action_dim] or [B, action_dim] for centralized
+            
+        Returns:
+            next_obs: Next observation [B, n_agents, obs_dim] or [B, obs_dim]
+            reward: Reward [B, n_agents, 1] or [B, 1]
+            done: Done flag [B, n_agents, 1] or [B, 1]
+        """
+        if not hasattr(self, "experiment") or self.experiment is None:
+            raise RuntimeError("Cannot use oracle: experiment not available")
+        
+        # Get or create oracle environment instance
+        if not hasattr(self, "_oracle_env"):
+            try:
+                # Try to use the experiment's rollout_env
+                if hasattr(self.experiment, "rollout_env") and self.experiment.rollout_env is not None:
+                    # Create a copy/clone for oracle use to avoid interfering with training
+                    # For now, we'll use it directly but in a way that doesn't interfere
+                    self._oracle_env = self.experiment.rollout_env
+                else:
+                    # Create a new environment instance
+                    if hasattr(self.experiment, "task"):
+                        env_func = self.experiment.task.get_env_fun(
+                            num_envs=obs.shape[0] if len(obs.shape) >= 2 else 1,
+                            continuous_actions=self.experiment.continuous_actions,
+                            seed=getattr(self.experiment, "seed", 0),
+                            device=self.device,
+                        )
+                        self._oracle_env = env_func()
+                        # Apply transforms if needed
+                        if hasattr(self.experiment, "test_env") and hasattr(self.experiment.test_env, "transform"):
+                            from torchrl.envs import TransformedEnv
+                            transforms = self.experiment.test_env.transform
+                            self._oracle_env = TransformedEnv(self._oracle_env, transforms.clone())
+                    else:
+                        raise RuntimeError("Cannot create oracle environment: task not available")
+            except Exception as e:
+                raise RuntimeError(f"Cannot use oracle: failed to get environment: {e}")
+        
+        # Prepare TensorDict for environment step
+        batch_dims = obs.shape[:-2] if len(obs.shape) >= 3 else obs.shape[:-1]
+        n_agents = obs.shape[-2] if len(obs.shape) >= 3 else 1
+        B = int(batch_dims[0]) if len(batch_dims) > 0 else 1
+        
+        # Create input TensorDict matching environment format
+        # The environment expects the current state/observation to be set
+        td_in = TensorDict({}, batch_size=batch_dims, device=self.device)
+        td_in.set(
+            group,
+            TensorDict(
+                {
+                    "observation": obs,
+                },
+                batch_size=(*batch_dims, n_agents) if len(obs.shape) >= 3 else batch_dims,
+                device=self.device,
+            ),
+        )
+        td_in.set((group, "action"), action)
+        
+        # Step the environment
+        try:
+            # Use the environment's step function
+            # Note: This requires the environment to be in the state corresponding to `obs`
+            # For most TorchRL environments, we need to set the state first or use reset
+            # For now, we'll try stepping directly - this works if the environment
+            # can step from the observation state (some environments support this)
+            td_out = self._oracle_env.step(td_in)
+            
+            # Extract results
+            next_obs = td_out.get((group, "observation"))
+            reward = td_out.get(("next", group, "reward"), None)
+            if reward is None:
+                reward = td_out.get(("next", "reward"), None)
+                if reward is not None:
+                    # Expand to match group shape
+                    reward = reward.expand(*next_obs.shape[:-1], 1)
+            
+            done = td_out.get(("next", group, "done"), None)
+            if done is None:
+                done = td_out.get(("next", "done"), None)
+                if done is not None:
+                    # Expand to match group shape
+                    if len(next_obs.shape) >= 3:
+                        done = done.unsqueeze(-2).expand(*next_obs.shape[:-1], 1)
+                    else:
+                        done = done.unsqueeze(-1)
+            
+            # Ensure done is boolean and has correct shape
+            if done is not None:
+                done = done.to(torch.bool)
+                if done.dim() < next_obs.dim():
+                    done = done.unsqueeze(-1)
+            else:
+                # Default: not done
+                done = torch.zeros(*next_obs.shape[:-1], 1, device=self.device, dtype=torch.bool)
+            
+            # Ensure reward has correct shape
+            if reward is None:
+                reward = torch.zeros(*next_obs.shape[:-1], 1, device=self.device, dtype=torch.float32)
+            elif reward.dim() < next_obs.dim():
+                reward = reward.unsqueeze(-1)
+            
+            # Create done_logit (convert boolean to logit: 0.0 for False, large positive for True)
+            done_logit = done.float() * 10.0 - 5.0  # Maps False->-5.0, True->5.0 (sigmoid(5.0) ≈ 0.99)
+            
+            return next_obs, reward, done_logit
+            
+        except Exception as e:
+            # Fallback: if direct step doesn't work, try alternative approach
+            # Some environments may require reset first
+            raise RuntimeError(f"Oracle environment step failed: {e}. "
+                             f"Note: Oracle mode requires environment to support stepping from arbitrary states.")
+
     def _sample_start_states(
         self, group: str, flat_batch: TensorDictBase, sample_size: int
     ) -> Optional[TensorDictBase]:
@@ -2016,6 +2836,12 @@ class _MbpoWorldModelMixin:
         else:
             ep_rew = torch.zeros((*batch_dims, n_agents, 1), device=self.device, dtype=torch.float32)
 
+        # Optional uncertainty thresholding to avoid using inaccurate synthetic samples.
+        unc_threshold = self._get_rollout_uncertainty_threshold(group)
+        unc_metric = str(
+            getattr(self, "rollout_uncertainty_metric", "total_rew_unc") or "total_rew_unc"
+        )
+
         for _ in range(horizon):
             td_in = TensorDict({}, batch_size=batch_dims, device=self.device)
             td_in.set(
@@ -2039,7 +2865,55 @@ class _MbpoWorldModelMixin:
             # Policy may also output logits/log_prob/loc/scale; keep them to match real replay schema.
             policy_group = policy_td.get(group)
 
-            next_obs, reward_pred, done_logit = self._predict_next(group, obs, action)
+            # Env-level termination mask so we can prevent adding transitions after termination.
+            env_done = done_mask.any(dim=-2)  # [B, 1]
+            env_active = (~env_done).squeeze(-1)  # [B]
+
+            # Decide if this synthetic transition is valid (active and below uncertainty threshold).
+            synthetic_valid_env = env_active.clone()
+            invalid_agent = None
+            # Use oracle (simulator) if enabled, otherwise use world model
+            if getattr(self, "use_oracle", False):
+                try:
+                    next_obs, reward_pred, done_logit = self._step_oracle_env(group, obs, action)
+                except Exception as e:
+                    # If oracle fails, fall back to model prediction
+                    import warnings
+                    warnings.warn(f"Oracle step failed, falling back to model: {e}")
+                    if unc_threshold is None:
+                        next_obs, reward_pred, done_logit = self._predict_next(group, obs, action)
+                    else:
+                        next_obs, reward_pred, done_logit, unc = self._predict_next_with_uncertainty(
+                            group, obs, action
+                        )
+                        unc_val = unc.get(unc_metric, None)
+                        if unc_val is None:
+                            unc_val = unc.get("total_rew_unc", None)
+                        if unc_val is not None:
+                            unc_val = unc_val.to(self.device)
+                            invalid_unc = (~torch.isfinite(unc_val)) | (unc_val > float(unc_threshold))
+                            synthetic_valid_env = synthetic_valid_env & (~invalid_unc)
+            elif unc_threshold is None:
+                next_obs, reward_pred, done_logit = self._predict_next(group, obs, action)
+            else:
+                next_obs, reward_pred, done_logit, unc = self._predict_next_with_uncertainty(
+                    group, obs, action
+                )
+                unc_val = unc.get(unc_metric, None)
+                if unc_val is None:
+                    unc_val = unc.get("total_rew_unc", None)
+                if unc_val is not None:
+                    unc_val = unc_val.to(self.device)
+                    invalid_unc = (~torch.isfinite(unc_val)) | (unc_val > float(unc_threshold))
+                    synthetic_valid_env = synthetic_valid_env & (~invalid_unc)
+
+            invalid_env = ~synthetic_valid_env
+            if invalid_env.any():
+                invalid_agent = invalid_env.view(*batch_dims, 1, 1).expand(
+                    *batch_dims, n_agents, 1
+                )
+                # Do not propagate the model further for invalid envs.
+                next_obs = torch.where(invalid_agent, obs, next_obs)
             # Optionally replace learned reward with oracle reward computed from predicted next state.
             if self._oracle_reward_enabled():
                 try:
@@ -2047,8 +2921,14 @@ class _MbpoWorldModelMixin:
                 except Exception:
                     # If oracle reward can't be computed, fall back to learned reward head.
                     pass
+
+            if invalid_agent is not None:
+                # Ensure invalid transitions contribute nothing and terminate immediately.
+                reward_pred = reward_pred.masked_fill(invalid_agent, 0.0)
             done_prob = torch.sigmoid(done_logit)
             done_flag = done_prob > 0.5
+            if invalid_agent is not None:
+                done_flag = done_flag | invalid_agent
             done_flag = done_flag | done_mask
 
             # Update episode reward (per-agent cumulative)
@@ -2084,6 +2964,10 @@ class _MbpoWorldModelMixin:
             # Top-level done/terminated (current transition). We mirror next for simplicity.
             rollout_td.set("done", env_done_next.detach())
             rollout_td.set("terminated", env_done_next.detach())
+            rollout_td.set(
+                "synthetic_valid",
+                synthetic_valid_env.view(*batch_dims, 1).to(torch.bool).detach(),
+            )
 
             rollout_td.set(
                 "next",
@@ -2138,7 +3022,6 @@ class _MbpoWorldModelMixin:
                 keep_B = max(1, min(B, int(target_synth // T)))
                 if keep_B < B:
                     out = out[:, :keep_B]
-
         return out
 
     def save_world_model(self, filepath: str) -> None:
@@ -2184,9 +3067,15 @@ class _MbpoWorldModelMixin:
                 "model_lr": self.model_lr,
                 "model_hidden_size": self.model_hidden_size,
                 "model_num_layers": self.model_num_layers,
+                # Optional recurrent-world-model config (used by MbpoRecurrent*).
+                # Backward compatible: older checkpoints won't have these keys.
+                "history_length": int(getattr(self, "history_length", 0) or 0),
+                "future_length": int(getattr(self, "future_length", 1) or 1),
+                "gru_num_layers": int(getattr(self, "world_model_gru_num_layers", 1) or 1),
                 "reward_loss_coef": float(getattr(self, "reward_loss_coef", 1.0)),
+                "logvar_loss_coef": float(getattr(self, "logvar_loss_coef", 1.0)),
+                "state_normalize": bool(getattr(self, "state_normalize", False)),
                 "reward_normalize": bool(getattr(self, "reward_normalize", False)),
-                "reward_norm_alpha": float(getattr(self, "reward_norm_alpha", 0.01)),
                 "reward_norm_eps": float(getattr(self, "reward_norm_eps", 1e-6)),
                 "separate_reward_net": bool(getattr(self, "separate_reward_net", False)),
                 "centralized_dynamics": self.centralized_dynamics,
@@ -2195,6 +3084,12 @@ class _MbpoWorldModelMixin:
                 "min_log_var": self.min_log_var,
                 "max_log_var": self.max_log_var,
                 "warmup_steps": self.warmup_steps,
+                "rollout_uncertainty_threshold": getattr(self, "rollout_uncertainty_threshold", None),
+                "rollout_uncertainty_thresholds": getattr(self, "rollout_uncertainty_thresholds", None),
+                "rollout_uncertainty_metric": str(
+                    getattr(self, "rollout_uncertainty_metric", "total_rew_unc") or "total_rew_unc"
+                ),
+                "use_oracle": bool(getattr(self, "use_oracle", False)),
                 "oracle_reward": bool(getattr(self, "oracle_reward", False)),
                 "oracle_reward_mode": str(getattr(self, "oracle_reward_mode", "")),
                 "oracle_reward_goal_rel_indices": getattr(self, "oracle_reward_goal_rel_indices", None),
@@ -2241,9 +3136,14 @@ class _MbpoWorldModelMixin:
                 "model_lr": self.model_lr,
                 "model_hidden_size": self.model_hidden_size,
                 "model_num_layers": self.model_num_layers,
+                # Optional recurrent-world-model config (used by MbpoRecurrent*).
+                "history_length": int(getattr(self, "history_length", 0) or 0),
+                "future_length": int(getattr(self, "future_length", 1) or 1),
+                "gru_num_layers": int(getattr(self, "world_model_gru_num_layers", 1) or 1),
                 "reward_loss_coef": float(getattr(self, "reward_loss_coef", 1.0)),
+                "logvar_loss_coef": float(getattr(self, "logvar_loss_coef", 1.0)),
+                "state_normalize": bool(getattr(self, "state_normalize", False)),
                 "reward_normalize": bool(getattr(self, "reward_normalize", False)),
-                "reward_norm_alpha": float(getattr(self, "reward_norm_alpha", 0.01)),
                 "reward_norm_eps": float(getattr(self, "reward_norm_eps", 1e-6)),
                 "separate_reward_net": bool(getattr(self, "separate_reward_net", False)),
                 "centralized_dynamics": self.centralized_dynamics,
@@ -2252,6 +3152,12 @@ class _MbpoWorldModelMixin:
                 "min_log_var": self.min_log_var,
                 "max_log_var": self.max_log_var,
                 "warmup_steps": self.warmup_steps,
+                "rollout_uncertainty_threshold": getattr(self, "rollout_uncertainty_threshold", None),
+                "rollout_uncertainty_thresholds": getattr(self, "rollout_uncertainty_thresholds", None),
+                "rollout_uncertainty_metric": str(
+                    getattr(self, "rollout_uncertainty_metric", "total_rew_unc") or "total_rew_unc"
+                ),
+                "use_oracle": bool(getattr(self, "use_oracle", False)),
                 "oracle_reward": bool(getattr(self, "oracle_reward", False)),
                 "oracle_reward_mode": str(getattr(self, "oracle_reward_mode", "")),
                 "oracle_reward_goal_rel_indices": getattr(self, "oracle_reward_goal_rel_indices", None),
@@ -2339,9 +3245,11 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         rollout_horizon_max: Optional[int] = None,
         rollout_horizon_ramp_steps: int = 0,
         reward_loss_coef: float = 1.0,
+        logvar_loss_coef: float = 1.0,  # scaling coefficient for log-variance term in NLL loss
+        state_normalize: bool = False,
         reward_normalize: bool = False,
-        reward_norm_alpha: float = 0.01,
         reward_norm_eps: float = 1e-6,
+        normalization_stats_json: Optional[str] = None,
         separate_reward_net: bool = False,
         training_iterations: int = 0,
         centralized_dynamics: bool = False,
@@ -2350,6 +3258,10 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
         min_log_var: float = -10.0,
         max_log_var: float = -2.0,
         warmup_steps: int = 0,
+        rollout_uncertainty_threshold: Optional[float] = None,
+        rollout_uncertainty_thresholds: Optional[Dict[str, float]] = None,
+        rollout_uncertainty_metric: str = "total_rew_unc",
+        use_oracle: bool = False,
         load_world_model_path: Optional[str] = None,
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
@@ -2384,9 +3296,11 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
             model_num_layers=model_num_layers,
             syn_ratio=syn_ratio,
             reward_loss_coef=reward_loss_coef,
+            logvar_loss_coef=logvar_loss_coef,
+            state_normalize=state_normalize,
             reward_normalize=reward_normalize,
-            reward_norm_alpha=reward_norm_alpha,
             reward_norm_eps=reward_norm_eps,
+            normalization_stats_json=normalization_stats_json,
             separate_reward_net=separate_reward_net,
             training_iterations=training_iterations,
             centralized_dynamics=centralized_dynamics,
@@ -2395,6 +3309,10 @@ class MbpoMasac(_MbpoWorldModelMixin, Masac):
             min_log_var=min_log_var,
             max_log_var=max_log_var,
             warmup_steps=warmup_steps,
+            rollout_uncertainty_threshold=rollout_uncertainty_threshold,
+            rollout_uncertainty_thresholds=rollout_uncertainty_thresholds,
+            rollout_uncertainty_metric=rollout_uncertainty_metric,
+            use_oracle=use_oracle,
             load_world_model_path=load_world_model_path,
             load_world_model_strict=load_world_model_strict,
             save_world_model_path=save_world_model_path,
@@ -2454,9 +3372,11 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
         rollout_horizon_max: Optional[int] = None,
         rollout_horizon_ramp_steps: int = 0,
         reward_loss_coef: float = 1.0,
+        logvar_loss_coef: float = 1.0,  # scaling coefficient for log-variance term in NLL loss
+        state_normalize: bool = False,
         reward_normalize: bool = False,
-        reward_norm_alpha: float = 0.01,
         reward_norm_eps: float = 1e-6,
+        normalization_stats_json: Optional[str] = None,
         separate_reward_net: bool = False,
         training_iterations: int = 0,
         centralized_dynamics: bool = False,
@@ -2465,6 +3385,10 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
         min_log_var: float = -10.0,
         max_log_var: float = -2.0,
         warmup_steps: int = 0,
+        rollout_uncertainty_threshold: Optional[float] = None,
+        rollout_uncertainty_thresholds: Optional[Dict[str, float]] = None,
+        rollout_uncertainty_metric: str = "total_rew_unc",
+        use_oracle: bool = False,
         load_world_model_path: Optional[str] = None,
         load_world_model_strict: bool = True,
         save_world_model_path: Optional[str] = None,
@@ -2499,9 +3423,11 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
             model_num_layers=model_num_layers,
             syn_ratio=syn_ratio,
             reward_loss_coef=reward_loss_coef,
+            logvar_loss_coef=logvar_loss_coef,
+            state_normalize=state_normalize,
             reward_normalize=reward_normalize,
-            reward_norm_alpha=reward_norm_alpha,
             reward_norm_eps=reward_norm_eps,
+            normalization_stats_json=normalization_stats_json,
             separate_reward_net=separate_reward_net,
             training_iterations=training_iterations,
             centralized_dynamics=centralized_dynamics,
@@ -2510,6 +3436,10 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
             min_log_var=min_log_var,
             max_log_var=max_log_var,
             warmup_steps=warmup_steps,
+            rollout_uncertainty_threshold=rollout_uncertainty_threshold,
+            rollout_uncertainty_thresholds=rollout_uncertainty_thresholds,
+            rollout_uncertainty_metric=rollout_uncertainty_metric,
+            use_oracle=use_oracle,
             load_world_model_path=load_world_model_path,
             load_world_model_strict=load_world_model_strict,
             save_world_model_path=save_world_model_path,
@@ -2527,7 +3457,6 @@ class MbpoMappo(_MbpoWorldModelMixin, Mappo):
             world_model_debug_video_obs_xy_indices=world_model_debug_video_obs_xy_indices,
             world_model_debug_video_mode=world_model_debug_video_mode,
         )
-
 
 # Backwards-compatible name: default MBPO remains MASAC-based.
 Mbpo = MbpoMasac
@@ -2551,9 +3480,11 @@ class MbpoConfig(MasacConfig):
     rollout_horizon_max: Optional[int] = None
     rollout_horizon_ramp_steps: int = 0
     reward_loss_coef: float = 1.0
+    state_normalize: bool = False
     reward_normalize: bool = False
-    reward_norm_alpha: float = 0.01
     reward_norm_eps: float = 1e-6
+    normalization_stats_json: Optional[str] = None
+    use_oracle: bool = False
     separate_reward_net: bool = False
     training_iterations: int = 0
     centralized_dynamics: bool = False
@@ -2561,7 +3492,11 @@ class MbpoConfig(MasacConfig):
     n_elites: Optional[int] = None
     min_log_var: float = -10.0
     max_log_var: float = -2.0
+    logvar_loss_coef: float = 1.0
     warmup_steps: int = 0
+    rollout_uncertainty_threshold: Optional[float] = None
+    rollout_uncertainty_thresholds: Optional[Dict[str, float]] = None
+    rollout_uncertainty_metric: str = "total_rew_unc"
     load_world_model_path: Optional[str] = None
     load_world_model_strict: bool = True
     save_world_model_path: Optional[str] = None
@@ -2622,9 +3557,11 @@ class MbpoMappoConfig(MappoConfig):
     rollout_horizon_max: Optional[int] = None
     rollout_horizon_ramp_steps: int = 0
     reward_loss_coef: float = 1.0
+    state_normalize: bool = False
     reward_normalize: bool = False
-    reward_norm_alpha: float = 0.01
     reward_norm_eps: float = 1e-6
+    normalization_stats_json: Optional[str] = None
+    use_oracle: bool = False
     separate_reward_net: bool = False
     training_iterations: int = 0
     centralized_dynamics: bool = False
@@ -2632,7 +3569,11 @@ class MbpoMappoConfig(MappoConfig):
     n_elites: Optional[int] = None
     min_log_var: float = -10.0
     max_log_var: float = -2.0
+    logvar_loss_coef: float = 1.0
     warmup_steps: int = 0
+    rollout_uncertainty_threshold: Optional[float] = None
+    rollout_uncertainty_thresholds: Optional[Dict[str, float]] = None
+    rollout_uncertainty_metric: str = "total_rew_unc"
     load_world_model_path: Optional[str] = None
     load_world_model_strict: bool = True
     save_world_model_path: Optional[str] = None

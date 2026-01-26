@@ -74,6 +74,11 @@ class WorldModelTrainConfig:
     val_batches: int = 10  # number of minibatches to evaluate per group
     val_batch_size: Optional[int] = None  # defaults to batch_size
     update_elites_from_val: bool = True  # update elite indices using validation losses
+    
+    # Uncertainty threshold computation
+    compute_uncertainty_threshold: bool = False  # compute uncertainty thresholds from validation data
+    uncertainty_threshold_percentile: float = 90.0  # percentile to use as threshold (e.g., 90 = 90th percentile)
+    uncertainty_metric: str = "total_rew_unc"  # which uncertainty metric to use: 'epistemic_obs_var', 'epistemic_rew_std', 'aleatoric_obs_logvar', 'aleatoric_rew_logvar', 'total_obs_unc', 'total_rew_unc'
 
 
 def _get_wm_cfg(cfg: DictConfig) -> WorldModelTrainConfig:
@@ -231,6 +236,10 @@ def hydra_train_world_model(cfg: DictConfig) -> None:
     total_updates = 0
     import random
     random.seed(int(cfg.seed) + 202_601_08)
+    
+    # Collect uncertainty values across all validation batches for threshold computation
+    per_group_uncertainty_values: Dict[str, Dict[str, List[torch.Tensor]]] = {}
+    
     for epoch in range(max(1, int(wm_cfg.epochs))):
         random.shuffle(train_shards)
         for shard_i, shard_path in enumerate(train_shards):
@@ -290,6 +299,21 @@ def hydra_train_world_model(cfg: DictConfig) -> None:
                                 for k, v in metrics.items():
                                     per_group_metrics_sum[g][k] = per_group_metrics_sum[g].get(k, 0.0) + float(v)
                                 per_group_metrics_n[g] = per_group_metrics_n.get(g, 0) + 1
+                                
+                                # Collect per-sample uncertainty values for threshold computation
+                                if (
+                                    wm_cfg.compute_uncertainty_threshold
+                                    and hasattr(algo, "_compute_per_sample_uncertainty")
+                                ):
+                                    try:
+                                        unc_dict = algo._compute_per_sample_uncertainty(g, mbv)  # type: ignore[attr-defined]
+                                        if g not in per_group_uncertainty_values:
+                                            per_group_uncertainty_values[g] = {}
+                                        for unc_key, unc_tensor in unc_dict.items():
+                                            per_group_uncertainty_values[g].setdefault(unc_key, []).append(unc_tensor)
+                                    except Exception as e:
+                                        # Silently skip if uncertainty computation fails
+                                        pass
 
                         for g, losses_list in per_group_losses.items():
                             losses_stack = torch.stack(losses_list, dim=0)  # [n, ensemble]
@@ -309,6 +333,8 @@ def hydra_train_world_model(cfg: DictConfig) -> None:
                                 f"loss_total={metrics_mean.get('eval/loss_total', float('nan')):.6f} "
                                 f"obs_mse={metrics_mean.get('eval/mse_observation', float('nan')):.6f} "
                                 f"rew_mse={metrics_mean.get('eval/mse_reward', float('nan')):.6f} "
+                                f"obs_smape={metrics_mean.get('eval/smape_observation', float('nan')):.3f} "
+                                f"rew_smape={metrics_mean.get('eval/smape_reward', float('nan')):.3f} "
                                 f"obs_r2={metrics_mean.get('eval/r2_observation', float('nan')):.3f} "
                                 f"rew_r2={metrics_mean.get('eval/r2_reward', float('nan')):.3f}"
                             )
@@ -325,6 +351,88 @@ def hydra_train_world_model(cfg: DictConfig) -> None:
                             except Exception:
                                 pass
 
+    # Compute uncertainty thresholds from collected validation data
+    uncertainty_thresholds: Dict[str, Dict[str, float]] = {}
+    if wm_cfg.compute_uncertainty_threshold and per_group_uncertainty_values:
+        print("\n[train_world_model] Computing uncertainty thresholds from validation data...")
+        threshold_percentile = float(wm_cfg.uncertainty_threshold_percentile)
+        threshold_percentile = max(0.0, min(100.0, threshold_percentile))
+        uncertainty_metric = str(wm_cfg.uncertainty_metric)
+        
+        for g, unc_dict in per_group_uncertainty_values.items():
+            uncertainty_thresholds[g] = {}
+            
+            # Compute statistics for each uncertainty metric
+            for unc_key, unc_tensors in unc_dict.items():
+                if not unc_tensors:
+                    continue
+                # Concatenate all uncertainty values
+                all_unc = torch.cat(unc_tensors, dim=0)
+                all_unc = all_unc[torch.isfinite(all_unc)]
+                
+                if all_unc.numel() == 0:
+                    continue
+                
+                # Compute statistics
+                mean_unc = float(all_unc.mean().item())
+                std_unc = float(all_unc.std().item())
+                median_unc = float(all_unc.median().item())
+                
+                # Compute percentiles
+                percentiles = [50.0, 75.0, 90.0, 95.0, 99.0]
+                percentile_values = {}
+                for p in percentiles:
+                    q = torch.quantile(all_unc, p / 100.0, interpolation="linear")
+                    percentile_values[f"p{p}"] = float(q.item())
+                
+                # Use the specified percentile as the threshold
+                threshold = torch.quantile(all_unc, threshold_percentile / 100.0, interpolation="linear")
+                threshold_value = float(threshold.item())
+                
+                uncertainty_thresholds[g][unc_key] = {
+                    "threshold": threshold_value,
+                    "mean": mean_unc,
+                    "std": std_unc,
+                    "median": median_unc,
+                    "percentiles": percentile_values,
+                    "n_samples": int(all_unc.numel()),
+                }
+                
+                print(
+                    f"  Group={g}, Metric={unc_key}: "
+                    f"threshold={threshold_value:.6f} (p{threshold_percentile:.1f}), "
+                    f"mean={mean_unc:.6f}, std={std_unc:.6f}, "
+                    f"n_samples={all_unc.numel()}"
+                )
+        
+        # Save thresholds to a separate file
+        threshold_path = save_path.parent / f"{save_path.stem}_uncertainty_thresholds.json"
+        # Convert to JSON-serializable format
+        thresholds_json = {}
+        for g, metrics in uncertainty_thresholds.items():
+            thresholds_json[g] = {}
+            for metric, stats in metrics.items():
+                thresholds_json[g][metric] = {
+                    k: (float(v) if isinstance(v, (int, float)) else v)
+                    for k, v in stats.items()
+                }
+        
+        with open(threshold_path, "w") as f:
+            json.dump(thresholds_json, f, indent=2)
+        print(f"\n[train_world_model] Saved uncertainty thresholds to: {str(threshold_path)}")
+        
+        # Also save the primary threshold (using the specified metric) for easy access
+        primary_thresholds = {}
+        for g, metrics in uncertainty_thresholds.items():
+            if uncertainty_metric in metrics:
+                primary_thresholds[g] = metrics[uncertainty_metric]["threshold"]
+        
+        if primary_thresholds:
+            primary_path = save_path.parent / f"{save_path.stem}_uncertainty_threshold_{uncertainty_metric}.json"
+            with open(primary_path, "w") as f:
+                json.dump(primary_thresholds, f, indent=2)
+            print(f"[train_world_model] Saved primary thresholds ({uncertainty_metric}) to: {str(primary_path)}")
+    
     algo.save_world_model(str(save_path))  # type: ignore[attr-defined]
     print(f"\n[train_world_model] Saved world model to: {str(save_path)}")
 

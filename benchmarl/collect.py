@@ -44,12 +44,14 @@ import hydra
 import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-from tensordict import TensorDictBase
+from tensordict import TensorDict, TensorDictBase
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import Categorical, OneHot
 from torchrl.envs import ParallelEnv, SerialEnv, TransformedEnv
 from torchrl.envs.transforms import Compose
 from torchrl.envs.utils import ExplorationType, set_exploration_type
+
+import torch.nn.functional as F
 
 from benchmarl.algorithms import algorithm_config_registry
 from benchmarl.experiment import Experiment
@@ -94,6 +96,18 @@ class CollectConfig:
     # Storage
     output_dir: Optional[str] = None
     flatten_batch: bool = True
+    # Dataset format:
+    # - "flat": save a flat batch (old behavior; equivalent to flatten_batch=True)
+    # - "trajectory": save the unflattened collector batch (typically [T, B, ...])
+    # - "flat_with_history": save a flat batch with `(group, "observation_history")` computed
+    #   from the time dimension (useful for recurrent world models, e.g. mbpo_recurrent).
+    # - "both": save both flat and trajectory shards.
+    dataset_format: str = "flat"
+    # When dataset_format is "flat_with_history" or "both", these control data collection:
+    # max_history_length: maximum window length for history (L = max_history_length + 1)
+    # max_future_length: maximum window length for future prediction (minimum 1)
+    max_history_length: int = 0
+    max_future_length: int = 1
     save_every_n_batches: int = 1
     # Avoid creating W&B / CSV logs for the auxiliary policy experiments.
     disable_loggers: bool = True
@@ -104,6 +118,13 @@ class CollectConfig:
     #   python benchmarl/collect.py task=... algorithm=... ++collect.merge_from=dataset/a,dataset/b ++collect.merge_output_dir=dataset/merged
     merge_from: Optional[str] = None
     merge_output_dir: Optional[str] = None
+    # Optional: filter which shard formats to merge (comma-separated).
+    # Formats are those written in index.jsonl under the "format" field, e.g.:
+    # - "flat" (default flattened shards)
+    # - "flat_hist" (flat shards with observation/action history + next_recurrent windows)
+    # - "traj" (trajectory shards)
+    # When unset/empty, all shard formats found in the sources are merged.
+    merge_formats: Optional[str] = None
     # How to materialize shard files in the merged dataset:
     # - "copy": copy shard files into the merged directory (most portable)
     # - "hardlink": create hardlinks (fast, but requires same filesystem)
@@ -180,6 +201,7 @@ def merge_datasets(
     input_dirs: List[Path],
     output_dir: Path,
     mode: str = "copy",
+    formats: Optional[List[str]] = None,
 ) -> None:
     """Merge datasets created by this script into one directory.
 
@@ -200,6 +222,8 @@ def merge_datasets(
     merged_from: List[str] = []
     merged_records: List[Dict[str, Any]] = []
     batch_idx = 0
+    allowed_formats = {str(x).strip() for x in (formats or []) if str(x).strip()}
+    formats_present: set[str] = set()
 
     for src_i, src in enumerate(input_dirs):
         if not src.exists() or not src.is_dir():
@@ -215,6 +239,14 @@ def merge_datasets(
             rel = str(rec.get("path", "")).strip()
             if not rel:
                 continue
+
+            # Optional filtering by shard format (e.g., keep only "flat_hist" for recurrent datasets).
+            rec_fmt = rec.get("format", None)
+            if allowed_formats and str(rec_fmt).strip() not in allowed_formats:
+                continue
+            if rec_fmt is not None:
+                formats_present.add(str(rec_fmt))
+
             shard_src = src / rel
             if not shard_src.exists():
                 # Skip missing shards rather than failing the whole merge.
@@ -234,14 +266,12 @@ def merge_datasets(
                 else:
                     shutil.copy2(shard_src, shard_dst)
 
-            merged_records.append(
-                {
-                    "batch_idx": batch_idx,
-                    "path": shard_dst.name,
-                    "numel": int(rec["numel"]) if rec.get("numel") is not None else None,
-                    "source_dir": str(src),
-                }
-            )
+            # Preserve all per-record metadata (e.g. "format") while rewriting path/batch_idx.
+            new_rec = dict(rec)
+            new_rec["batch_idx"] = batch_idx
+            new_rec["path"] = shard_dst.name
+            new_rec["source_dir"] = str(src)
+            merged_records.append(new_rec)
             batch_idx += 1
 
     # Write merged index.jsonl
@@ -256,6 +286,7 @@ def merge_datasets(
         "num_sources": len(input_dirs),
         "num_shards": len(merged_records),
         "source_metas": source_metas,
+        "formats_present": sorted(formats_present),
     }
     (output_dir / "meta.json").write_text(json.dumps(merged_meta, indent=2), encoding="utf-8")
 
@@ -335,6 +366,318 @@ def _random_actions_for_group(
     if hasattr(spec, "shape") and spec.shape is not None and len(spec.shape):
         last_dim = int(spec.shape[-1])
     return torch.randn((*batch_shape, last_dim), device=obs.device, dtype=torch.float32)
+
+
+def _ensure_group_reward_done_like_next_obs(
+    td: TensorDictBase, group: str
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Return (reward, done) tensors shaped like
+    ("next", group, "observation")'s leading dims.
+
+    Some envs/collectors store reward/done at 
+    ("next","reward") / ("next","done") instead of group-level.
+    This helper tries to return group-level-like tensors with
+    shape [..., n_agents, 1] when possible.
+    """
+    keys = td.keys(True, True)
+    try:
+        next_obs = td.get(("next", group, "observation"))
+    except Exception:
+        next_obs = None
+
+    rew = None
+    done = None
+
+    if ("next", group, "reward") in keys:
+        try:
+            rew = td.get(("next", group, "reward"))
+        except Exception:
+            rew = None
+    elif ("next", "reward") in keys and next_obs is not None:
+        try:
+            r = td.get(("next", "reward"))
+            # Expand to [..., n_agents] then add trailing singleton dim.
+            lead = next_obs.shape[:-1]
+            rew = r.expand(*lead).unsqueeze(-1)
+        except Exception:
+            rew = None
+
+    if ("next", group, "done") in keys:
+        try:
+            done = td.get(("next", group, "done"))
+        except Exception:
+            done = None
+    elif ("next", "done") in keys and next_obs is not None:
+        try:
+            d = td.get(("next", "done"))
+            lead = next_obs.shape[:-1]
+            done = d.expand(*lead).unsqueeze(-1)
+        except Exception:
+            done = None
+
+    return rew, done
+
+
+def _make_flat_batch_with_observation_history(
+    td: TensorDictBase, *, groups: List[str], max_history_length: int = 0, max_future_length: int = 1
+) -> TensorDictBase:
+    """Convert a trajectory batch into a flat batch with observation/action history and future windows.
+
+    Expected input (common TorchRL collector output): top-level batch_size = [T, B]
+    with group tensors shaped like:
+      (group,"observation"): [T, B, n_agents, obs_dim] (or extra obs dims)
+      (group,"action"):      [T, B, n_agents, ...]
+      ("next",group,"observation"): [T, B, n_agents, obs_dim]
+      ("next",group,"reward"), ("next",group,"done") (or top-level next reward/done)
+
+    Output is a flat TensorDict with batch_size [N] containing:
+      - (group, "observation"): [N, n_agents, obs_dim]
+      - (group, "observation_history"): [N, L, n_agents, obs_dim] where L = max_history_length + 1
+      - (group, "action_history"): [N, L, n_agents, action_dim]
+      - (group, "action"): [N, n_agents, action_dim]
+      - ("next", group, ...): single-step (backwards compatible)
+      - ("next_recurrent", group, ...): multi-step future windows [N, L', n_agents, ...] where L' = max_future_length
+    """
+
+    # If the input has no time dimension, we can't build windows
+    if td.batch_size is None or len(td.batch_size) < 2:
+        raise ValueError("no_time_dim")
+
+    max_history_length = max(0, int(max_history_length))
+    max_future_length = max(1, int(max_future_length))
+    L = max_history_length + 1  # History window length
+
+    # Build a per-group flat TD and then merge into a common top-level TD.
+    out: Optional[TensorDict] = None
+    for g in groups:
+        keys = td.keys(True, True)
+        if (
+            (g, "observation") not in keys
+            or (g, "action") not in keys
+            or ("next", g, "observation") not in keys
+        ):
+            continue
+
+        obs = td.get((g, "observation"))
+        action = td.get((g, "action"))
+        next_obs = td.get(("next", g, "observation"))
+        reward, done = _ensure_group_reward_done_like_next_obs(td, g)
+        if reward is None or done is None:
+            continue
+
+        # Require at least [B, T, n_agents, ...]
+        if obs.dim() < 4:
+            continue
+
+        # The data is structured as [B, T, n_agents, ...], where B is the number of
+        # parallel environments, and T the maximum number of timesteps.
+        # The done tensor is used to segment trajectories.
+
+        d_any = done.squeeze(-1).any(dim=-1)  # [B, T]
+        try:
+            # Segment trajectories for each batch (env roll)
+            all_windows = []
+            for b in range(d_any.shape[0]):
+                done1d = d_any[b]  # [T]
+                ends = (done1d == True).nonzero(as_tuple=False).flatten().tolist()  # episode ends (inclusive)
+                starts = [0] + [i + 1 for i in ends]
+                ends = ends + [d_any.shape[1] - 1]  # cover tail
+
+                # Process each trajectory segment
+                for s, e in zip(starts, ends):
+                    if s > e or s >= obs.shape[1]:
+                        continue
+                    
+                    traj_len = e - s + 1
+                    if traj_len < 1:
+                        continue
+
+                    # Extract trajectory segment
+                    traj_obs = obs[b, s : e + 1]  # [traj_len, n_agents, obs_dim]
+                    traj_action = action[b, s : e + 1]  # [traj_len, n_agents, action_dim]
+                    traj_next_obs = next_obs[b, s : e + 1]  # [traj_len, n_agents, obs_dim]
+                    traj_reward = reward[b, s : e + 1]  # [traj_len, n_agents, ...]
+                    traj_done = done[b, s : e + 1]  # [traj_len, n_agents, ...]
+                    
+                    # Extract action_mask if present
+                    traj_action_mask = None
+                    if (g, "action_mask") in keys:
+                        try:
+                            am = td.get((g, "action_mask"))
+                            if am.dim() >= 3:  # [B, T, n_agents, ...] or similar
+                                traj_action_mask = am[b, s : e + 1]
+                        except Exception:
+                            pass
+
+                    # Create sliding windows
+                    # Start from position where we have enough history
+
+                    for t in range(L - 1, traj_len):
+                        
+                        # Check if window crosses episode boundary (done flag in history window)
+                        if max_history_length > 0:
+                            # Check if any done=True in the history window (excluding current step)
+
+                            history_done = traj_done[max(0, t - L + 1) : t]
+                            if history_done.numel() > 0 and history_done.any():
+                                continue  # Skip windows that cross episode boundaries
+
+                        # History window: [t-L+1, t] (inclusive)
+                        hist_start = max(0, t - L + 1)
+                        obs_hist = traj_obs[hist_start : t + 1]  # [actual_L, n_agents, obs_dim]
+                        action_hist = traj_action[hist_start : t + 1]  # [actual_L, n_agents, action_dim]
+
+                        # Pad history if needed (shouldn't happen if L <= traj_len, but handle edge case)
+                        if obs_hist.shape[0] < L:
+                            # Repeat first observation/action to pad
+                            pad_len = L - obs_hist.shape[0]
+                            first_obs = obs_hist[0:1].expand(pad_len, -1, -1)
+                            first_action = action_hist[0:1].expand(pad_len, -1, -1)
+                            obs_hist = torch.cat([first_obs, obs_hist], dim=0)
+                            action_hist = torch.cat([first_action, action_hist], dim=0)
+
+                        # Current observation and action at position t
+                        curr_obs = traj_obs[t]  # [n_agents, obs_dim]
+                        curr_action = traj_action[t]  # [n_agents, action_dim]
+                        curr_action_mask = traj_action_mask[t] if traj_action_mask is not None else None
+
+                        # Future window: [t+1, t+1+L'] (if available)
+                        future_start = t + 1
+                        future_end = min(traj_len, future_start + max_future_length)
+                        future_len = future_end - future_start
+
+                        if future_len > 0:
+                            next_obs_future = traj_next_obs[future_start : future_end]  # [future_len, n_agents, obs_dim]
+                            reward_future = traj_reward[future_start : future_end]  # [future_len, n_agents, ...]
+                            done_future = traj_done[future_start : future_end]  # [future_len, n_agents, ...]
+
+                            # Pad future if needed
+                            if future_len < max_future_length:
+                                pad_len = max_future_length - future_len
+                                last_obs = next_obs_future[-1:].expand(pad_len, -1, -1)
+                                last_reward = reward_future[-1:].expand(pad_len, -1, -1)
+                                last_done = done_future[-1:].expand(pad_len, -1, -1)
+                                next_obs_future = torch.cat([next_obs_future, last_obs], dim=0)
+                                reward_future = torch.cat([reward_future, last_reward], dim=0)
+                                done_future = torch.cat([done_future, last_done], dim=0)
+                        else:
+                            # No future available, pad with last observation
+                            last_obs = traj_obs[-1:].expand(max_future_length, -1, -1)
+                            last_reward = traj_reward[-1:].expand(max_future_length, -1, -1)
+                            last_done = traj_done[-1:].expand(max_future_length, -1, -1)
+                            next_obs_future = last_obs
+                            reward_future = last_reward
+                            done_future = last_done
+
+                        # Single-step next (for backwards compatibility)
+                        if future_len > 0:
+                            next_obs_single = traj_next_obs[future_start]  # [n_agents, obs_dim]
+                            reward_single = traj_reward[future_start]  # [n_agents, ...]
+                            done_single = traj_done[future_start]  # [n_agents, ...]
+                        else:
+                            # Use last observation if no future
+                            next_obs_single = traj_obs[-1]
+                            reward_single = traj_reward[-1]
+                            done_single = traj_done[-1]
+
+                        window_data = {
+                            "obs_hist": obs_hist,  # [L, n_agents, obs_dim]
+                            "action_hist": action_hist,  # [L, n_agents, action_dim]
+                            "obs": curr_obs,  # [n_agents, obs_dim]
+                            "action": curr_action,  # [n_agents, action_dim]
+                            "next_obs_single": next_obs_single,  # [n_agents, obs_dim]
+                            "reward_single": reward_single,  # [n_agents, ...]
+                            "done_single": done_single,  # [n_agents, ...]
+                            "next_obs_future": next_obs_future,  # [max_future_length, n_agents, obs_dim]
+                            "reward_future": reward_future,  # [max_future_length, n_agents, ...]
+                            "done_future": done_future,  # [max_future_length, n_agents, ...]
+                        }
+
+                        if curr_action_mask is not None:
+                            window_data["action_mask"] = curr_action_mask
+                        all_windows.append(window_data)
+
+            if not all_windows:
+                continue
+
+
+            # Stack all windows
+            N = len(all_windows)
+            device = all_windows[0]["obs"].device
+            n_agents = int(all_windows[0]["obs"].shape[-2])
+            obs_dim = int(all_windows[0]["obs"].shape[-1])
+
+            obs_hist_stack = torch.stack([w["obs_hist"] for w in all_windows], dim=0)  # [N, L, n_agents, obs_dim]
+            action_hist_stack = torch.stack([w["action_hist"] for w in all_windows], dim=0)  # [N, L, n_agents, action_dim]
+            obs_stack = torch.stack([w["obs"] for w in all_windows], dim=0)  # [N, n_agents, obs_dim]
+            action_stack = torch.stack([w["action"] for w in all_windows], dim=0)  # [N, n_agents, action_dim]
+            next_obs_single_stack = torch.stack([w["next_obs_single"] for w in all_windows], dim=0)  # [N, n_agents, obs_dim]
+            reward_single_stack = torch.stack([w["reward_single"] for w in all_windows], dim=0)  # [N, n_agents, ...]
+            done_single_stack = torch.stack([w["done_single"] for w in all_windows], dim=0)  # [N, n_agents, ...]
+            next_obs_future_stack = torch.stack([w["next_obs_future"] for w in all_windows], dim=0)  # [N, max_future_length, n_agents, obs_dim]
+            reward_future_stack = torch.stack([w["reward_future"] for w in all_windows], dim=0)  # [N, max_future_length, n_agents, ...]
+            done_future_stack = torch.stack([w["done_future"] for w in all_windows], dim=0)  # [N, max_future_length, n_agents, ...]
+
+            # Build group TensorDict
+            group_payload: Dict[str, torch.Tensor] = {
+                "observation": obs_stack.contiguous(),
+                "observation_history": obs_hist_stack.contiguous(),
+                "action_history": action_hist_stack.contiguous(),
+                "action": action_stack.contiguous(),
+            }
+
+            # Handle action_mask if present
+            if any("action_mask" in w for w in all_windows):
+                try:
+                    action_mask_list = [w.get("action_mask") for w in all_windows if "action_mask" in w]
+                    if action_mask_list and len(action_mask_list) == N:
+                        action_mask_stack = torch.stack(action_mask_list, dim=0)
+                        group_payload["action_mask"] = action_mask_stack.contiguous()
+                except Exception:
+                    pass
+
+            # Batch-size should match the leading dimension(s) of tensors. Here all tensors
+            # are shaped with leading dim [N, ...] (agent is a tensor dim, not a TD batch dim).
+            group_td = TensorDict(group_payload, batch_size=[N], device=device)
+
+            # Build next TensorDict (backwards compatible single-step)
+            next_group_td = TensorDict(
+                {
+                    "observation": next_obs_single_stack.contiguous(),
+                    "reward": reward_single_stack.contiguous(),
+                    "done": done_single_stack.contiguous(),
+                },
+                batch_size=[N],
+                device=device,
+            )
+
+            # Build next_recurrent TensorDict (multi-step future)
+            next_recurrent_group_td = TensorDict(
+                {
+                    "observation": next_obs_future_stack.contiguous(),
+                    "reward": reward_future_stack.contiguous(),
+                    "done": done_future_stack.contiguous(),
+                },
+                batch_size=[N],
+                device=device,
+            )
+
+            if out is None:
+                out = TensorDict({}, batch_size=[N], device=device)
+                out.set("next", TensorDict({}, batch_size=[N], device=device))
+                out.set("next_recurrent", TensorDict({}, batch_size=[N], device=device))
+
+            out.set(g, group_td)
+            out.get("next").set(g, next_group_td)
+            out.get("next_recurrent").set(g, next_recurrent_group_td)
+
+        except Exception as e:
+            print(f"Error in _make_flat_batch_with_observation_history for group {g}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    return out
 
 
 def _make_behavior_policy(
@@ -574,6 +917,7 @@ def hydra_collect(cfg: DictConfig) -> None:
             input_dirs=[Path(p) for p in merge_tokens],
             output_dir=out_dir,
             mode=str(collect_cfg.merge_mode),
+            formats=_parse_csv(getattr(collect_cfg, "merge_formats", None)),
         )
         print(f"\n[collect] Merged dataset written to: {str(out_dir)}")
         return
@@ -687,39 +1031,78 @@ def hydra_collect(cfg: DictConfig) -> None:
     n_batches = 0
     total_frames = 0
 
+    fmt = str(getattr(collect_cfg, "dataset_format", "flat") or "flat").strip().lower()
+    if fmt not in ("flat", "trajectory", "flat_with_history", "both"):
+        raise ValueError(
+            "collect.dataset_format must be one of: flat|trajectory|flat_with_history|both"
+        )
+
     with set_exploration_type(exploration):
         for batch in collector:
             if batch is None:
                 continue
-            batch = batch.detach()
-            if collect_cfg.flatten_batch:
-                try:
-                    batch = batch.reshape(-1)
-                except Exception:
-                    pass
+            batch_raw = batch.detach()
+
+            groups = list(base_experiment.group_map.keys())
+
+            # Build one or more payloads depending on requested format.
+            payloads: List[Tuple[str, TensorDictBase]] = []
+            if fmt in ("trajectory", "both"):
+                payloads.append(("traj", batch_raw))
+            if fmt in ("flat_with_history", "both"):
+                pl = _make_flat_batch_with_observation_history(
+                    batch_raw,
+                    groups=groups,
+                    max_history_length=int(getattr(collect_cfg, "max_history_length", 0)),
+                    max_future_length=int(getattr(collect_cfg, "max_future_length", 1)),
+                )
+                if pl is not None:
+                    payloads.append(
+                        ("flat_hist", pl)
+                    )
+            if fmt == "flat":
+                flat = batch_raw
+                if bool(getattr(collect_cfg, "flatten_batch", True)):
+                    try:
+                        flat = batch_raw.reshape(-1)
+                    except Exception:
+                        pass
+                payloads.append(("flat", flat))
 
             # Save shard(s)
             if n_batches % int(collect_cfg.save_every_n_batches) == 0:
-                shard_path = out_dir / f"batch_{n_batches:06d}.pt"
-                # Save on CPU to make dataset portable.
-                try:
-                    to_save = batch.to("cpu")
-                except Exception:
-                    to_save = batch
-                torch.save(to_save, shard_path)
-                rec = {
-                    "batch_idx": n_batches,
-                    "path": shard_path.name,
-                    "numel": int(batch.numel()),
-                }
-                with index_path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(rec) + "\n")
+                for suffix, td_to_save in payloads:
+                    # Keep the original shard naming for the default "flat" mode for backward compatibility.
+                    if fmt == "flat":
+                        shard_path = out_dir / f"batch_{n_batches:06d}.pt"
+                    else:
+                        shard_path = out_dir / f"batch_{n_batches:06d}_{suffix}.pt"
+
+                    # Save on CPU to make dataset portable.
+                    try:
+                        to_save = td_to_save.to("cpu")
+                    except Exception:
+                        to_save = td_to_save
+                    torch.save(to_save, shard_path)
+
+                    rec = {
+                        "batch_idx": n_batches,
+                        "path": shard_path.name,
+                        "numel": int(td_to_save.numel()),
+                        "format": suffix,
+                    }
+                    with index_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(rec) + "\n")
 
             # Best-effort frame count
             try:
-                bs0 = int(batch.batch_size[0]) if hasattr(batch, "batch_size") and len(batch.batch_size) else int(batch.numel())
+                bs0 = (
+                    int(batch_raw.batch_size[0])
+                    if hasattr(batch_raw, "batch_size") and len(batch_raw.batch_size)
+                    else int(batch_raw.numel())
+                )
             except Exception:
-                bs0 = int(batch.numel())
+                bs0 = int(batch_raw.numel())
             total_frames += bs0
             n_batches += 1
             if total_frames >= int(collect_cfg.total_frames):

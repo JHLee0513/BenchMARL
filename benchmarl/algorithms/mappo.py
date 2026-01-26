@@ -206,6 +206,7 @@ class Mappo(Algorithm):
         return policy_for_loss
 
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
+
         keys = list(batch.keys(True, True))
         group_shape = batch.get(group).shape
 
