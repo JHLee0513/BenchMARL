@@ -5,6 +5,7 @@
 #
 
 import pathlib
+import re
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -245,6 +246,14 @@ class Algorithm(ABC):
             policies.append(self._policies_for_collection[group])
         return TensorDictSequential(*policies)
 
+    def train_minibatch_multiplier(self, group: str) -> int:
+        """Optional hook to scale optimizer minibatches without changing env steps.
+
+        Default is 1 for all algorithms. MBPO can override this to process synthetic data
+        in additional bounded-size minibatches rather than concatenating huge batches.
+        """
+        return 1
+
     def get_parameters(self, group: str) -> Dict[str, Iterable]:
         """
         Get the dictionary mapping loss names to the relative parameters to optimize for a given group.
@@ -409,15 +418,62 @@ class AlgorithmConfig:
         Args:
             path (str, optional): The full path of the yaml file to load from.
                 If None, it will default to
-                ``benchmarl/conf/algorithm/self.associated_class().__name__``
+                ``benchmarl/conf/algorithm/<derived-name>.yaml`` where `<derived-name>` is
+                inferred from the algorithm/config class names (with fallbacks for snake_case files).
 
         Returns: the loaded AlgorithmConfig
         """
 
         if path is None:
-            config = AlgorithmConfig._load_from_yaml(
-                name=cls.associated_class().__name__
-            )
+            def _to_snake(name: str) -> str:
+                # e.g. "MbpoRecurrentMasac" -> "mbpo_recurrent_masac"
+                s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+                s2 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1)
+                return s2.lower()
+
+            # Historically, yaml files have been named in snake_case (e.g. mbpo_mappo.yaml),
+            # while the original loader used CamelCase associated class names
+            # (e.g. MbpoMappo -> mbpomappo.yaml). We try both to stay backward compatible.
+            candidates: List[str] = []
+
+            # 1) Original behavior: associated algorithm class name.
+            assoc_name = cls.associated_class().__name__
+            candidates += [assoc_name, _to_snake(assoc_name)]
+
+            # 2) Config class name (and without "Config" suffix), in both Camel and snake.
+            cfg_name = cls.__name__
+            candidates += [cfg_name, _to_snake(cfg_name)]
+            if cfg_name.endswith("Config"):
+                base = cfg_name[: -len("Config")]
+                if base:
+                    candidates += [base, _to_snake(base)]
+
+            # De-duplicate while preserving order.
+            seen = set()
+            deduped: List[str] = []
+            for c in candidates:
+                c = str(c)
+                if c in seen:
+                    continue
+                seen.add(c)
+                deduped.append(c)
+
+            last_err: Optional[Exception] = None
+            config = None
+            for name in deduped:
+                try:
+                    config = AlgorithmConfig._load_from_yaml(name=name)
+                    last_err = None
+                    break
+                except FileNotFoundError as e:
+                    last_err = e
+                    continue
+
+            if config is None:
+                tried = ", ".join([f"{n.lower()}.yaml" for n in deduped])
+                raise FileNotFoundError(
+                    f"Could not find algorithm yaml for {cls.__name__}. Tried: {tried}"
+                ) from last_err
 
         else:
             config = _read_yaml_config(path)

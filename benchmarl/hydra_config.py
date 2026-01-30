@@ -4,10 +4,11 @@
 #  LICENSE file in the root directory of this source tree.
 #
 import importlib
-from dataclasses import is_dataclass
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 from benchmarl.algorithms.common import AlgorithmConfig
+from benchmarl.algorithms import algorithm_config_registry
 from benchmarl.environments import task_config_registry, TaskClass
 from benchmarl.environments.common import _type_check_task_config
 from benchmarl.experiment import Experiment, ExperimentConfig
@@ -31,7 +32,11 @@ class _HydraMissingMetadataError(FileNotFoundError):
 
 
 def load_experiment_from_hydra(
-    cfg: DictConfig, task_name: str, callbacks=()
+    cfg: DictConfig,
+    task_name: str,
+    callbacks=(),
+    *,
+    algorithm_name: str | None = None,
 ) -> Experiment:
     """Creates an :class:`~benchmarl.experiment.Experiment` from hydra config.
 
@@ -43,7 +48,9 @@ def load_experiment_from_hydra(
         :class:`~benchmarl.experiment.Experiment`
 
     """
-    algorithm_config = load_algorithm_config_from_hydra(cfg.algorithm)
+    algorithm_config = load_algorithm_config_from_hydra(
+        cfg.algorithm, algorithm_name=algorithm_name
+    )
     experiment_config = load_experiment_config_from_hydra(cfg.experiment)
     task_config = load_task_config_from_hydra(cfg.task, task_name)
     model_config = load_model_config_from_hydra(cfg.model)
@@ -94,7 +101,9 @@ def load_experiment_config_from_hydra(cfg: DictConfig) -> ExperimentConfig:
     return OmegaConf.to_object(cfg)
 
 
-def load_algorithm_config_from_hydra(cfg: DictConfig) -> AlgorithmConfig:
+def load_algorithm_config_from_hydra(
+    cfg: DictConfig, *, algorithm_name: str | None = None
+) -> AlgorithmConfig:
     """Returns a :class:`~benchmarl.algorithms.AlgorithmConfig` from hydra config.
 
     Args:
@@ -104,7 +113,43 @@ def load_algorithm_config_from_hydra(cfg: DictConfig) -> AlgorithmConfig:
         :class:`~benchmarl.algorithms.AlgorithmConfig`
 
     """
-    return OmegaConf.to_object(cfg)
+    # Convert to dict first
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    
+    # Determine algorithm name.
+    # IMPORTANT: Avoid heuristic matching. Adding extra keys (e.g. MBPO-only
+    # `load_world_model_path`) can otherwise change which AlgorithmConfig class is picked,
+    # breaking reproducibility and even changing the algorithm implementation.
+    if algorithm_name is None and _has_hydra:
+        try:
+            from hydra.core.hydra_config import HydraConfig
+
+            if HydraConfig.initialized():
+                hydra_cfg = HydraConfig.get()
+                if hydra_cfg is not None and hasattr(hydra_cfg.runtime, "choices"):
+                    algorithm_name = hydra_cfg.runtime.choices.get("algorithm")
+        except Exception:
+            algorithm_name = None
+    
+    # Get the algorithm config class
+    if algorithm_name is not None and algorithm_name in algorithm_config_registry:
+        config_class = algorithm_config_registry[algorithm_name]
+        # Get valid field names from the dataclass
+        valid_fields = {f.name for f in fields(config_class)}
+        # Filter config to only include valid fields
+        filtered_cfg = {k: v for k, v in cfg_dict.items() if k in valid_fields}
+        # Instantiate the config class with filtered fields
+        return config_class(**filtered_cfg)
+    else:
+        cfg_dict_keys = set(cfg_dict.keys())
+        raise ValueError(
+            "Could not determine algorithm config class because `algorithm_name` is missing or unknown.\n"
+            f"- algorithm_name: {algorithm_name}\n"
+            f"- cfg keys: {sorted(cfg_dict_keys)}\n"
+            f"- available algorithms: {sorted(list(algorithm_config_registry.keys()))}\n"
+            "Fix: call `load_experiment_from_hydra(..., algorithm_name=...)` (recommended) or run via "
+            "`benchmarl/run.py` so Hydra choices are available."
+        )
 
 
 def load_model_config_from_hydra(cfg: DictConfig) -> ModelConfig:
@@ -188,4 +233,4 @@ def reload_experiment_from_file(restore_file: str) -> Experiment:
     print("\nLoaded config:\n")
     print(OmegaConf.to_yaml(cfg))
 
-    return load_experiment_from_hydra(cfg, task_name=task_name)
+    return load_experiment_from_hydra(cfg, task_name=task_name, algorithm_name=algorithm_name)

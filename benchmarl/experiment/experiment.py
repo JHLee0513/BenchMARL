@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 import importlib
-
+import math
 import os
 import pickle
 import shutil
@@ -742,12 +742,28 @@ class Experiment(CallbackNotifier):
                 group_buffer.extend(group_batch.to(group_buffer.storage.device))
 
                 training_tds = []
-                for _ in range(self.config.n_optimizer_steps(self.on_policy)):
+                # Allow algorithms to scale the number of optimizer steps (e.g., MBPO with syn_ratio > 0)
+                # to maintain constant sample coverage when total sample count increases.
+                try:
+                    opt_steps_mult = float(self.algorithm.n_optimizer_steps_multiplier(group))
+                except Exception:
+                    opt_steps_mult = 1.0
+                opt_steps_mult = max(1.0, opt_steps_mult)
+                n_opt_steps = int(math.ceil(self.config.n_optimizer_steps(self.on_policy) * opt_steps_mult))
+                for _ in range(n_opt_steps):
+                    # Allow algorithms to scale the number of optimizer minibatches (e.g., MBPO synthetic training)
+                    # without changing environment collection / step counters.
+                    try:
+                        mb_mult = int(self.algorithm.train_minibatch_multiplier(group))
+                    except Exception:
+                        mb_mult = 1
+                    mb_mult = max(1, mb_mult)
                     for _ in range(
                         -(
                             -self.config.train_batch_size(self.on_policy)
                             // self.config.train_minibatch_size(self.on_policy)
                         )
+                        * mb_mult
                     ):
                         training_tds.append(self._optimizer_loop(group))
                 training_td = torch.stack(training_tds)
