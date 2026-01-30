@@ -394,6 +394,7 @@ class _DynamicsModel(nn.Module):
         layers: List[nn.Module] = []
         last_dim = input_dim
         for _ in range(num_layers):
+            # layers += [nn.Linear(last_dim, hidden_size), nn.LayerNorm(hidden_size), nn.LeakyReLU()]
             layers += [nn.Linear(last_dim, hidden_size), nn.LeakyReLU()]
             last_dim = hidden_size
         self.net = nn.Sequential(*layers)
@@ -459,7 +460,8 @@ class _DynamicsModel(nn.Module):
             rew_log_var = rew_log_var * 0.0
 
         mu_next_obs = obs_flat + delta_mu
-        return mu_next_obs, delta_log_var, rew_mu, rew_log_var, done_logit
+        # return mu_next_obs, delta_log_var, rew_mu, rew_log_var, done_logit
+        return delta_mu, delta_log_var, rew_mu, rew_log_var, done_logit
 
 
 class _MbpoWorldModelMixin:
@@ -2118,6 +2120,7 @@ class _MbpoWorldModelMixin:
                 loss_rew = torch.mean((mu_rew_n - r_n) ** 2 * inv_var_rew_n + logvar_coef * lv_rew_n)
             else:
                 loss_rew = torch.mean((mu_rew - r) ** 2 * inv_var_rew + logvar_coef * lv_rew)
+                # loss_rew = torch.nn.functional.huber_loss(mu_rew, r)
             if self._oracle_reward_enabled() and bool(
                 getattr(self, "oracle_reward_disable_reward_head_loss", True)
             ):
